@@ -1,0 +1,35 @@
+deepspeed --num_gpus 4 src/lorra_mistral_coarse.py \
+    --model_name_or_path  "/data/chaojian/Mistral-7B-Instruct-v0.1" \
+    --grained "safety" \
+    --target_layers "10,12,14,16,18,20" \
+    --lorra_alpha 2 \
+    --lorra_beta 0 \
+    --lora_r 16 \
+    --lora_alpha 64 \
+    --lora_dropout 0.05 \
+    --output_dir ./lorra_trurh_7b \
+    --overwrite_output_dir \
+    --bf16 True \
+    --per_device_train_batch_size 4 \
+    --per_device_eval_batch_size 32 \
+    --gradient_accumulation_steps 2 \
+    --max_steps 50 \
+    --do_eval \
+    --evaluation_strategy "steps" \
+    --eval_steps 10  \
+    --save_total_limit 0 \
+    --learning_rate 3e-4 \
+    --weight_decay 0. \
+    --lr_scheduler_type "constant" \
+    --logging_strategy "steps" \
+    --logging_steps 10 \
+    --tf32 True \
+    --q_lora False \
+    --deepspeed configs/ds_zero2.json \
+    --gradient_checkpointing true \
+    --report_to none \
+    --dataloader_drop_last True \
+    --remove_unused_columns False \
+    --dataloader_pin_memory False \
+    --max_res_len 128 \
+    --data_format "contrastAns"
