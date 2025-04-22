@@ -8,7 +8,7 @@ from openai import OpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ======== 配置区域 ========
-API_KEY = 'sk-14384779c93c40cabf0238d3699d00c8' # 通过环境变量传入
+API_KEY = '<your aapi key here>' # 通过环境变量传入
 DATA_PATH = "/data/chaojian/Multi-alignment/dataset/crows_pair_stereotype"
 OUTPUT_PATH = "Multi-alignment/stereotype_dataset.jsonl"
 MODEL_NAME = "qwen-plus"

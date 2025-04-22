@@ -7,7 +7,7 @@
 
 # # ======== 配置区域 ========
 # API_URL = "https://api.deepseek.com/v1/chat/completions"
-# API_KEY = "sk-28fef07857074e77a6134844159f8b08"  # ⚠️ 建议通过环境变量传入更安全
+# API_KEY = "<your_api_key>"  # ⚠️ 建议通过环境变量传入更安全
 
 # DATA_PATH = "/data/chaojian/Multi-alignment/dataset/pku-safety"
 # OUTPUT_PATH = "Multi-alignment/pku_safety_dataset.jsonl"
@@ -86,7 +86,7 @@ from openai import OpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ======== 配置区域 ========
-API_KEY = "sk-e459d7a3a7f743cbbb83d6764380eb6b" # 通过环境变量传入
+API_KEY = "<your_api_key>" # 通过环境变量传入
 DATA_PATH = "/data/chaojian/Multi-alignment/dataset/pku-safety"
 OUTPUT_PATH = "Multi-alignment/pku_safety_dataset.jsonl"
 MODEL_NAME = "deepseek-chat"
