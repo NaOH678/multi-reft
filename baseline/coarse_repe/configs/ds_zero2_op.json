@@ -1,0 +1,10 @@
+{
+  "zero_optimization": {
+    "stage": 2,          
+    "offload_optimizer": {"device": "none"}, 
+    "allgather_partitions": true,
+    "reduce_scatter": true
+  },
+  "train_batch_size": "auto",
+  "gradient_accumulation_steps": "auto"
+}
