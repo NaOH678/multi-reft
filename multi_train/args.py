@@ -68,4 +68,11 @@ class TrainingArguments(transformers.TrainingArguments):
     #     }
     # )
 
+    dropout: float = field(
+        default=0.0,
+        metadata={
+            "help": "drop out rate"
+        }
+    )
+
     

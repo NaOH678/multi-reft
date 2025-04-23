@@ -83,11 +83,11 @@ def main(
             instructions,
             input=None,
             temperature=0.1,
-            top_p=0.85,
+            top_p=0.75,
             top_k=40,
             num_beams=4,
             max_new_tokens=32,
-            positions=5,
+            positions=args.positions,
 
             **kwargs,
     ):
@@ -104,35 +104,54 @@ def main(
         # print(suffix)
         base_unit_location_batched = torch.cat([prefix, suffix], dim=1)
         # print(base_unit_location_batched)
+        # print(torch.tensor([base_unit_location_batched.tolist()]*len(model.interventions)))
+        # print(base_unit_location_batched.unsqueeze(0).repeat(len(model.interventions),1,1))
+        # print(torch.allclose(
+        #     torch.tensor([base_unit_location_batched.tolist()]*len(model.interventions)).to('cuda:2'),
+        #     base_unit_location_batched.unsqueeze(0).repeat(len(model.interventions),1,1)
 
-        generation_config = GenerationConfig(
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            # num_beams=num_beams,
-            no_repeat_ngram_size=5, 
-            repetition_penalty=1.1,
-            early_stopping=True,
-            max_new_tokens=max_new_tokens,
-            eos_token_id=tokenizer.eos_token_id,
-            intervene_on_prompt=True,
-            do_sample=True,
-            **kwargs,
-        )
+        # ))
 
+        
+        base_unit_location_batched = base_unit_location_batched.unsqueeze(0)\
+            .repeat(len(model.interventions),1,1)\
+            # .repeat_interleave(num_beams, dim=1).tolist()
 
+        
+        generation_args = {
+                "base": {"input_ids": inputs["input_ids"], "attention_mask": inputs["attention_mask"]},
+                
+                "intervene_on_prompt": True,
+                "eos_token_id": tokenizer.eos_token_id,
+                "early_stopping": True,
+            }
+        if args.greedy_decoding:
+            generation_args.update({"unit_locations": {"sources->base": (None, base_unit_location_batched.tolist())},
+                                    "max_new_tokens": max_new_tokens, 
+                                    "do_sample": False}
+                                )
+
+        else:
+            generation_args.update({"unit_locations": {"sources->base": (None, base_unit_location_batched\
+                                                                         .repeat_interleave(num_beams, dim=1).tolist())},
+                                    "max_new_tokens": max_new_tokens,
+                                    "temperature": temperature,
+                                    "top_p": top_p,
+                                    "top_k": top_k,
+                                    "num_beams": num_beams,
+                                    "do_sample": True}
+                                )
+                
         with torch.no_grad():
             _, reft_response = model.generate(
-            inputs, unit_locations={"sources->base": (None, [base_unit_location_batched.tolist()]*len(model.interventions)
-                                            )
-            },
-            # subspaces=[[[4,5,6,7]]*len(instructions)]*len(model.interventions),
-            intervene_on_prompt=True, max_new_tokens=32, do_sample=False, 
-            no_repeat_ngram_size=5, repetition_penalty=1.2,
-            eos_token_id=tokenizer.eos_token_id, early_stopping=True,temperature=0.1
-            
-            
-            )
+            # inputs, unit_locations={"sources->base": (None, [base_unit_location_batched.tolist()]*len(model.interventions)
+            #                                 )
+            # },
+            # # subspaces=[[[4,5,6,7]]*len(instructions)]*len(model.interventions),
+            # intervene_on_prompt=True, max_new_tokens=32, do_sample=False, 
+            # no_repeat_ngram_size=5, repetition_penalty=1.2,
+            # eos_token_id=tokenizer.eos_token_id, early_stopping=True,temperature=0.1
+            **generation_args)
         
         outputs = tokenizer.batch_decode(reft_response, skip_special_tokens=True)
         print(outputs)
@@ -140,7 +159,7 @@ def main(
         print(outputs)
         return outputs
 
-    save_file = f'multi_train/experiment/{args.base_model.lstrip("../").rstrip("/")}-{args.dataset}.json'
+    save_file = f'multi_train/experiment/{args.base_model.lstrip("../").rstrip("/")}-{"-".join(args.reft_weights.split("/")[2:]).strip(" ")}-{args.dataset}.json'
     create_dir('multi_train/experiment')
 
     dataset = load_data(args)
@@ -240,6 +259,8 @@ def parse_args():
     parser.add_argument('--base_model', required=True)
     parser.add_argument('--reft_weights', required=True)
     parser.add_argument('--batch_size', type=int, required=True)
+    parser.add_argument('--positions', type=int, default=5)
+    parser.add_argument('--greedy_decoding', type=bool, default=False)
     parser.add_argument('--load_8bit', action='store_true', default=False)
     parser.add_argument('--device', type=str, default='cuda:0')
 

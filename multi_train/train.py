@@ -1,4 +1,4 @@
-from transformers import AutoTokenizer, AutoModelForCausalLM, HfArgumentParser
+from transformers import AutoTokenizer, AutoModelForCausalLM, HfArgumentParser, AutoConfig
 from args import ReftArguments, TrainingArguments, DataArguments
 from datasets import load_dataset, concatenate_datasets, load_from_disk
 import transformers
@@ -12,6 +12,8 @@ from pyreft import (
     ReftDataCollator,
     ReftSupervisedDataset,
     LoreftIntervention,
+    NodireftIntervention,
+    NoreftIntervention,
     ReftTrainer,
     ReftTrainerForCausalLMDistributed
 )
@@ -83,7 +85,9 @@ if __name__== "__main__":
 
     model_name_or_path = training_args.model_name_or_path # yahma/llama-7b-hf or yahma/llama-13b-hf
     model = AutoModelForCausalLM.from_pretrained(
-        model_name_or_path, torch_dtype=torch.bfloat16)
+        model_name_or_path, 
+        torch_dtype=torch.bfloat16
+    )
 
     # get tokenizer
     model_max_length = training_args.model_max_length
@@ -102,25 +106,25 @@ if __name__== "__main__":
         percentage = data_args.percentage
 
     
-    helpful_data = load_from_disk('/data/chaojian/Multi-alignment/dataset/alignment_helpfulness').shuffle(seed=42)
-    helpful_data = helpful_data.select(range(min(max_samples, len(helpful_data))))
-    moral_data = load_from_disk('/data/chaojian/Multi-alignment/dataset/alignment_moral')['train'].shuffle(seed=42)
-    moral_data = moral_data.select(range(min(max_samples, len(moral_data))))
-    safety_data = load_from_disk('/data/chaojian/Multi-alignment/dataset/alignment_pku_safety')['train'].shuffle(seed=42)
-    safety_data = safety_data.select(range(min(max_samples, len(safety_data))))
-    stereotype_data = load_from_disk('/data/chaojian/Multi-alignment/dataset/alignment_stereotype')['train'].shuffle(seed=42)
-    stereotype_data = stereotype_data.select(range(min(max_samples, len(stereotype_data))))
-    toxicity_data = load_from_disk('/data/chaojian/Multi-alignment/dataset/alignment_toxic')['train'].shuffle(seed=42)
-    toxicity_data = toxicity_data.select(range(min(max_samples, len(toxicity_data))))
+    # helpful_data = load_from_disk('/data/chaojian/Multi-alignment/dataset/alignment_helpfulness').shuffle(seed=42)
+    # helpful_data = helpful_data.select(range(min(max_samples, len(helpful_data))))
+    # moral_data = load_from_disk('/data/chaojian/Multi-alignment/dataset/alignment_moral')['train'].shuffle(seed=42)
+    # moral_data = moral_data.select(range(min(max_samples, len(moral_data))))
+    # safety_data = load_from_disk('/data/chaojian/Multi-alignment/dataset/alignment_pku_safety')['train'].shuffle(seed=42)
+    # safety_data = safety_data.select(range(min(max_samples, len(safety_data))))
+    # stereotype_data = load_from_disk('/data/chaojian/Multi-alignment/dataset/alignment_stereotype')['train'].shuffle(seed=42)
+    # stereotype_data = stereotype_data.select(range(min(max_samples, len(stereotype_data))))
+    # toxicity_data = load_from_disk('/data/chaojian/Multi-alignment/dataset/alignment_toxic')['train'].shuffle(seed=42)
+    # toxicity_data = toxicity_data.select(range(min(max_samples, len(toxicity_data))))
     truthful_data = load_from_disk('/data/chaojian/Multi-alignment/dataset/alignment_truthful')['train'].shuffle(seed=42)
     truthful_data = truthful_data.select(range(min(max_samples, len(truthful_data))))
 
 
-    helpful_data = helpful_data.map(lambda x: {"subspaces": SUBSPACES['helpfulness']})
-    moral_data = moral_data.map(lambda x: {"subspaces": SUBSPACES['ethic']})
-    safety_data = safety_data.map(lambda x: {"subspaces": SUBSPACES['safety']})
-    stereotype_data = stereotype_data.map(lambda x: {"subspaces": SUBSPACES['stereotype']})
-    toxicity_data = toxicity_data.map(lambda x: {"subspaces": SUBSPACES['toxicity']})
+    # helpful_data = helpful_data.map(lambda x: {"subspaces": SUBSPACES['helpfulness']})
+    # moral_data = moral_data.map(lambda x: {"subspaces": SUBSPACES['ethic']})
+    # safety_data = safety_data.map(lambda x: {"subspaces": SUBSPACES['safety']})
+    # stereotype_data = stereotype_data.map(lambda x: {"subspaces": SUBSPACES['stereotype']})
+    # toxicity_data = toxicity_data.map(lambda x: {"subspaces": SUBSPACES['toxicity']})
     truthful_data = truthful_data.map(lambda x: {"subspaces": SUBSPACES['truth']})
 
     # print(helpful_data[1000])
@@ -128,13 +132,14 @@ if __name__== "__main__":
     # print(safety_data[4000])
 
 
-    subspace_dataset = concatenate_datasets([helpful_data, 
-                                             moral_data, 
-                                             safety_data, 
-                                             stereotype_data, 
-                                             toxicity_data, 
-                                             truthful_data])
+    # subspace_dataset = concatenate_datasets([helpful_data, 
+    #                                          moral_data, 
+    #                                          safety_data, 
+    #                                          stereotype_data, 
+    #                                          toxicity_data, 
+    #                                          truthful_data])
 
+    subspace_dataset = truthful_data
 
     # print(type(reftargs.target_layers))
     # print(reftargs.target_layers)
@@ -146,11 +151,24 @@ if __name__== "__main__":
     # print(TARGET_LAYERS)
 
     # get reft model
+    # reft_config = ReftConfig(representations=[
+    #     {
+    #         "layer": layer, "component": "block_output",
+    #         "intervention": SubloreftIntervention(
+    #         embed_dim=model.config.hidden_size, low_rank_dimension=6*reftargs.subspace_rank)
+    #     }
+    #     for layer in TARGET_LAYERS
+    #     ]
+    # )
+
     reft_config = ReftConfig(representations=[
         {
             "layer": layer, "component": "block_output",
-            "intervention": SubloreftIntervention(
-            embed_dim=model.config.hidden_size, low_rank_dimension=6*reftargs.subspace_rank)
+            "intervention": NodireftIntervention(
+            embed_dim=model.config.hidden_size, 
+            low_rank_dimension=reftargs.subspace_rank, 
+            dropout=training_args.dropout,
+            add_bias=False)
         }
         for layer in TARGET_LAYERS
         ]
@@ -164,10 +182,9 @@ if __name__== "__main__":
     "Subloreft", None, tokenizer, dataset=subspace_dataset,
     **{"num_interventions": len(reft_model.interventions), "position": reftargs.position , "share_weights": True},          # 该成f1+l1 梯度是0？？？？
     input_field=None, instruction_field="input", output_field="full_output",
-    no_stop=True
+    no_stop=False
     )
 
-    # print(train_dataset[0])
 
     data_collator_fn = transformers.DataCollatorForSeq2Seq(
         tokenizer=tokenizer,
@@ -179,19 +196,21 @@ if __name__== "__main__":
 
     if rank == 0:
         os.environ["WANDB_MODE"] = "offline"  # 如果你用 online 模式可以去掉这一行
-        wandb.init(project="my_reft_2", name=f"first_train_{rank}")
+        wandb.init(project="Reft_commensense", name=f"first_train_{rank}_with_eos_token")
 
     training_args = transformers.TrainingArguments(
-        num_train_epochs=6, 
+        num_train_epochs=training_args.num_train_epochs, 
         output_dir=training_args.output_dir, 
-        learning_rate=9e-4, 
+        learning_rate=training_args.learning_rate, 
         report_to='wandb',
-        per_device_train_batch_size=2, 
+        per_device_train_batch_size=training_args.per_device_train_batch_size, 
         logging_steps=10,
         ddp_find_unused_parameters=False,  # 关键修改
-        gradient_accumulation_steps=4,
-        save_total_limit=4,
-        run_name=f"first_train_{rank}" if rank == 0 else None
+        gradient_accumulation_steps=training_args.gradient_accumulation_steps,
+        warmup_ratio=training_args.warmup_ratio,
+        save_total_limit=10,
+        save_strategy=training_args.save_strategy,
+        weight_decay=training_args.weight_decay
     )
 
     
