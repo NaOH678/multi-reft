@@ -106,17 +106,17 @@ def main():
                         examples["instruction"][i],
                         examples["input"][i],
                         examples["output"][i]
-                    ))
+                    ) + tokenizer.eos_token)
                 else:
                     full_prompts.append(prompt_no_input % (
                         examples["instruction"][i],
                         examples['output'][i],
-                    ))
+                    ) + tokenizer.eos_token)
             elif "full_output" in examples:
                 full_prompts.append(prompt_no_input % (
                     examples["input"][i],
                     examples['full_output'][i],
-                ))
+                ) + tokenizer.eos_token)
             else:
                 raise ValueError("数据集格式不符合要求")
 
@@ -144,6 +144,7 @@ def main():
         return dict(input_ids=tokenized["input_ids"].tolist(),
                     attention_mask=tokenized["attention_mask"].tolist(),
                     labels=tokenized["labels"].tolist())
+    
     if data_args.dataset_name == "helpful":
         dataset = dataset.map(preprocess_function, batched=True).remove_columns(["instruction", "input", "output"])
     else:
