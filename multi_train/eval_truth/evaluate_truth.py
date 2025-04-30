@@ -94,73 +94,89 @@ def main(
         prompts = [generate_prompt(instruction, input) for instruction in instructions]
         tokenizer.padding_side = "left"
         inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(device)
-        base_unit_location = inputs["input_ids"].shape[-1] - 1
-        shift = inputs["attention_mask"].argmax(dim=1).unsqueeze(1)
-        l = positions
 
-        prefix = torch.arange(l).repeat(len(instructions), 1).to(device) + shift
-        # print(prefix)
-        suffix = torch.tensor([base_unit_location - i for i in range(l-1, -1, -1)]).repeat(len(instructions), 1).to(device)
-        # print(suffix)
-        base_unit_location_batched = torch.cat([prefix, suffix], dim=1)
-        # print(base_unit_location_batched)
-        # print(torch.tensor([base_unit_location_batched.tolist()]*len(model.interventions)))
-        # print(base_unit_location_batched.unsqueeze(0).repeat(len(model.interventions),1,1))
-        # print(torch.allclose(
-        #     torch.tensor([base_unit_location_batched.tolist()]*len(model.interventions)).to('cuda:2'),
-        #     base_unit_location_batched.unsqueeze(0).repeat(len(model.interventions),1,1)
+        if args.reft_weights:
+            base_unit_location = inputs["input_ids"].shape[-1] - 1
+            shift = inputs["attention_mask"].argmax(dim=1).unsqueeze(1)
+            l = positions
 
-        # ))
+            prefix = torch.arange(l).repeat(len(instructions), 1).to(device) + shift
+            # print(prefix)
+            suffix = torch.tensor([base_unit_location - i for i in range(l-1, -1, -1)]).repeat(len(instructions), 1).to(device)
+            # print(suffix)
+            base_unit_location_batched = torch.cat([prefix, suffix], dim=1)
+            # print(base_unit_location_batched)
+            # print(torch.tensor([base_unit_location_batched.tolist()]*len(model.interventions)))
+            # print(base_unit_location_batched.unsqueeze(0).repeat(len(model.interventions),1,1))
+            # print(torch.allclose(
+            #     torch.tensor([base_unit_location_batched.tolist()]*len(model.interventions)).to('cuda:2'),
+            #     base_unit_location_batched.unsqueeze(0).repeat(len(model.interventions),1,1)
 
-        
-        base_unit_location_batched = base_unit_location_batched.unsqueeze(0)\
-            .repeat(len(model.interventions),1,1)\
-            # .repeat_interleave(num_beams, dim=1).tolist()
+            # ))
 
-        
-        generation_args = {
-                "base": {"input_ids": inputs["input_ids"], "attention_mask": inputs["attention_mask"]},
-                
-                "intervene_on_prompt": True,
-                "eos_token_id": tokenizer.eos_token_id,
-                "early_stopping": True,
-            }
-        if args.greedy_decoding:
-            generation_args.update({"unit_locations": {"sources->base": (None, base_unit_location_batched.tolist())},
-                                    "max_new_tokens": max_new_tokens, 
-                                    "do_sample": False}
-                                )
+            base_unit_location_batched = base_unit_location_batched.unsqueeze(0)\
+                .repeat(len(model.interventions),1,1)\
+                # .repeat_interleave(num_beams, dim=1).tolist()
 
+            generation_args = {
+                    "base": {"input_ids": inputs["input_ids"], "attention_mask": inputs["attention_mask"]},
+                    
+                    "intervene_on_prompt": True,
+                    "eos_token_id": tokenizer.eos_token_id,
+                    "early_stopping": True,
+                }
+            if args.greedy_decoding:
+                generation_args.update({"unit_locations": {"sources->base": (None, base_unit_location_batched.tolist())},
+                                        "max_new_tokens": max_new_tokens, 
+                                        "do_sample": False}
+                                    )
+
+            else:
+                generation_args.update({"unit_locations": {"sources->base": (None, base_unit_location_batched\
+                                                                            .repeat_interleave(num_beams, dim=1).tolist())},
+                                        "max_new_tokens": max_new_tokens,
+                                        "temperature": temperature,
+                                        "top_p": top_p,
+                                        "top_k": top_k,
+                                        "num_beams": num_beams,
+                                        "do_sample": True}
+                                    )
+                    
+            with torch.no_grad():
+                _, response = model.generate(**generation_args)
+
+        # base_model 和 lora_model 共用
         else:
-            generation_args.update({"unit_locations": {"sources->base": (None, base_unit_location_batched\
-                                                                         .repeat_interleave(num_beams, dim=1).tolist())},
-                                    "max_new_tokens": max_new_tokens,
-                                    "temperature": temperature,
-                                    "top_p": top_p,
-                                    "top_k": top_k,
-                                    "num_beams": num_beams,
-                                    "do_sample": True}
-                                )
-                
-        with torch.no_grad():
-            _, reft_response = model.generate(
-            # inputs, unit_locations={"sources->base": (None, [base_unit_location_batched.tolist()]*len(model.interventions)
-            #                                 )
-            # },
-            # # subspaces=[[[4,5,6,7]]*len(instructions)]*len(model.interventions),
-            # intervene_on_prompt=True, max_new_tokens=32, do_sample=False, 
-            # no_repeat_ngram_size=5, repetition_penalty=1.2,
-            # eos_token_id=tokenizer.eos_token_id, early_stopping=True,temperature=0.1
-            **generation_args)
+            with torch.no_grad():
+                response = model.generate(
+                    inputs["input_ids"].to(device),
+                    attention_mask=inputs["attention_mask"].to(device),
+                    generation_config=GenerationConfig(
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=top_k,
+                        num_beams=num_beams,
+                        max_new_tokens=max_new_tokens,
+                    )
+                )
         
-        outputs = tokenizer.batch_decode(reft_response, skip_special_tokens=True)
+        outputs = tokenizer.batch_decode(response, skip_special_tokens=True)
         print(outputs)
         outputs = [o.split("### Response:")[1].strip() for o in outputs]
         print(outputs)
         return outputs
+    
+    
+    if not os.path.exists('./multi_train/eval_truth'):
+        os.mkdir('./multi_train/eval_truth')
 
-    save_file = f'multi_train/experiment/{args.base_model.lstrip("../").rstrip("/")}-{"-".join(args.reft_weights.split("/")[2:]).strip(" ")}-{args.dataset}.json'
-    create_dir('multi_train/experiment')
+    base_dir = f'multi_train/eval_truth/{args.base_model.lstrip("../").rstrip("/")}'
+    if args.reft_weights:
+        base_dir += f'_{"-".join(args.reft_weights.split("/")[3:]).strip(" ")}-{args.dataset}.json'
+    elif args.lora_weights:
+        base_dir += f'_{"-".join(args.lora_weights.split("/")[2:]).strip(" ")}-{args.dataset}.json'
+    save_file = base_dir
+    
 
     dataset = load_data(args)
     batches = create_batch(dataset, args.batch_size)
@@ -211,14 +227,14 @@ def create_dir(dir_path):
 
 def generate_prompt(instruction, input=None):
     prompt_no_input_template = """Below is an instruction that \
-    describes a task. Write a response that appropriately \
-    completes the request.
+describes a task. Write a response that appropriately \
+completes the request.
 
-    ### Instruction:
-    %s
+### Instruction:
+%s
 
-    ### Response:
-    """
+### Response:
+"""
 
     return prompt_no_input_template % instruction
 
@@ -254,11 +270,12 @@ def parse_args():
     # parser.add_argument('--model', choices=['LLaMA-7B', "LLaMA-13B",'BLOOM-7B', 'GPT-j-6B'], required=True)
     # parser.add_argument('--adapter', choices=['LoRA', 'AdapterP', 'AdapterH', 'Parallel'],
     #                     required=True)
-    parser.add_argument('--target_layers', type=int, nargs='+', required=True)
-    parser.add_argument('--subspace_rank', type=int, default=4, required=True)
+    parser.add_argument('--target_layers', type=int, nargs='+')
+    parser.add_argument('--subspace_rank', type=int, default=4)
     parser.add_argument('--base_model', required=True)
-    parser.add_argument('--reft_weights', required=True)
     parser.add_argument('--batch_size', type=int, required=True)
+    parser.add_argument('--reft_weights', type=str,default=None)
+    parser.add_argument('--lora_weights', type=str,default=None)
     parser.add_argument('--positions', type=int, default=5)
     parser.add_argument('--greedy_decoding', type=bool, default=False)
     parser.add_argument('--load_8bit', action='store_true', default=False)
@@ -279,9 +296,19 @@ def load_model(args) -> tuple:
     base_model = args.base_model
     if not base_model:
         raise ValueError(f'can not find base model name by the value: {args.model}')
+    else:
+        print(f'load base model: {base_model}')
     reft_weights = args.reft_weights
     if not reft_weights:
-        raise ValueError(f'can not find lora weight, the value is: {reft_weights}')
+        print(f'can not find reft weight, the value is: {reft_weights}')
+    else:
+        print(f'load reft weight: {reft_weights}')
+    lora_weight = args.lora_weights
+    if not lora_weight:
+        print(f'can not find lora weight, the value is: {lora_weight}')
+    else:
+        print(f'load lora weight: {lora_weight}')
+    
 
     # load_8bit = args.load_8bit
     
@@ -297,61 +324,34 @@ def load_model(args) -> tuple:
             trust_remote_code=True,
         ) # fix zwq
 
-    # elif device == "mps":
-    #     model = AutoModelForCausalLM.from_pretrained(
-    #         base_model,
-    #         device_map={"": device},
-    #         torch_dtype=torch.float16,
-    #     )
-    #     model = PeftModel.from_pretrained(
-    #         model,
-    #         # lora_weights,
-    #         device_map={"": device},
-    #         torch_dtype=torch.float16,
-    #     )
-    # else:
-    #     model = AutoModelForCausalLM.from_pretrained(
-    #         base_model, device_map={"": device}, low_cpu_mem_usage=True
-    #     )
-    #     model = PeftModel.from_pretrained(
-    #         model,
-    #         # lora_weights,
-    #         device_map={"": device},
-    #     )
+   
+    if reft_weights:
+        if args.target_layers == [-1]:
+            TARGET_LAYERS = list(range(len(model.model.layers)))
+        else:
+            TARGET_LAYERS = args.target_layers
 
-    #     # unwind broken decapoda-research config
-    #     # model.config.pad_token_id = tokenizer.pad_token_id = 0  # unk
-    #     # model.config.bos_token_id = 1
-    #     # model.config.eos_token_id = 2
+        reft_config = ReftConfig(representations=[
+            {
+                "layer": layer, "component": "block_output",
+                "intervention": NodireftIntervention(
+                embed_dim=model.config.hidden_size, low_rank_dimension=args.subspace_rank, add_bias=False)
+            }
+            for layer in TARGET_LAYERS
+            ]
+        )
 
-
-
-    #     if not load_8bit:
-    #         model.half()  # seems to fix bugs for some users.
-
-    #     model.eval()
-    #     if torch.__version__ >= "2" and sys.platform != "win32":
-    #         model = torch.compile(model)
-
-    if args.target_layers == [-1]:
-        TARGET_LAYERS = list(range(len(model.model.layers)))
-    else:
-        TARGET_LAYERS = args.target_layers
-
-    reft_config = ReftConfig(representations=[
-        {
-            "layer": layer, "component": "block_output",
-            "intervention": NodireftIntervention(
-            embed_dim=model.config.hidden_size, low_rank_dimension=args.subspace_rank, add_bias=False)
-        }
-        for layer in TARGET_LAYERS
-        ]
-    )
-
-    model = get_reft_model(model, reft_config)
-    model.load_intervention(reft_weights, 
-                             include_model=True)
-
+        model = get_reft_model(model, reft_config)
+        model.load_intervention(reft_weights, 
+                                include_model=True)
+    elif lora_weight:
+        model = PeftModel.from_pretrained(
+            model,
+            lora_weight,
+            device_map={"": args.device},
+            torch_dtype=torch.bfloat16,
+        )
+    
     return tokenizer, model
 
 

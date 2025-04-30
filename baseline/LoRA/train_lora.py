@@ -101,7 +101,7 @@ def main():
         full_prompts = []
         for i in range(len(examples["input"])):
             if "instruction" in examples:
-                if examples["input"][i] is None:
+                if examples["input"][i]:
                     full_prompts.append(prompt_input % (
                         examples["instruction"][i],
                         examples["input"][i],
@@ -112,6 +112,7 @@ def main():
                         examples["instruction"][i],
                         examples['output'][i],
                     ) + tokenizer.eos_token)
+                    
             elif "full_output" in examples:
                 full_prompts.append(prompt_no_input % (
                     examples["input"][i],
@@ -120,6 +121,7 @@ def main():
             else:
                 raise ValueError("数据集格式不符合要求")
 
+        print(full_prompts[0])
         # 批量分词
         tokenized = tokenizer(
             full_prompts,
@@ -138,7 +140,8 @@ def main():
         labels = tokenized["input_ids"].clone()
         for idx, start_pos in enumerate(response_starts):
             labels[idx, :start_pos] = -100
-            
+        
+        labels[labels == tokenizer.pad_token_id] = -100
         tokenized["labels"] = labels
         # 转换张量为列表以兼容数据集映射
         return dict(input_ids=tokenized["input_ids"].tolist(),
@@ -149,7 +152,7 @@ def main():
         dataset = dataset.map(preprocess_function, batched=True).remove_columns(["instruction", "input", "output"])
     else:
         dataset = dataset.map(preprocess_function, batched=True).remove_columns(["input", "full_output"])
-    
+    print(len(dataset))
     print(dataset[0])
     print()
     # 训练配置
@@ -163,6 +166,8 @@ def main():
         weight_decay=training_args.weight_decay,
         save_strategy=training_args.save_strategy,
         report_to="wandb" if accelerator.is_main_process else None,
+        label_names=["labels"],
+        warmup_steps=training_args.warmup_steps,
         logging_steps=1,
     )
     

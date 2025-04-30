@@ -24,6 +24,13 @@ class ReftArguments:
             "help": "rank of the subspace to be intervened"
         }
     )
+    subtask: str = field(
+        default="truthful",
+        metadata={
+            "help": "subspace to be intervened. ['truthful', 'safety', 'toxic', 'stereotype', 'helpfulness', 'moral']"
+        }
+    )
+
 
 @dataclass
 class DataArguments:
@@ -72,6 +79,13 @@ class TrainingArguments(transformers.TrainingArguments):
         default=0.0,
         metadata={
             "help": "drop out rate"
+        }
+    )
+
+    seed: int = field(
+        default=42,
+        metadata={
+            "help": "seed"
         }
     )
 
