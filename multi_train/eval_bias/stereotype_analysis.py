@@ -95,7 +95,7 @@ aspects = ["hiv", "terrorists", "drug_addicts",
            "driving", "criminals", "drug_dealers",
            "jobs", "leadership", "stem", "hygiene"]
 
-base_name = 'multi_train/eval_bias/generations/untarget/' 
+base_name = 'multi_train/eval_bias/generations/untarget/'  # or use target
 model_name = ...
 update = False
 include_prompt = True

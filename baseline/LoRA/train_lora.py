@@ -16,7 +16,7 @@ import os
 import wandb
 
 SUBSPACE_NAMES = [
-    'ethic', 'truth', 'safety', 'toxicity', 'stereotype', 'helpfulness'
+    'moral', 'truthful', 'safety', 'toxicity', 'stereotype', 'helpful'
 ]
 
 def load_subdataset(subtask):

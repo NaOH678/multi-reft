@@ -142,5 +142,7 @@ if __name__ == "__main__":
     # 拼接所有结果
     for layer in final_hidden_states:
         final_hidden_states[layer] = torch.cat(final_hidden_states[layer], dim=0)
+    
+    
 
     torch.save(final_hidden_states, "/data/chaojian/Multi-alignment/llama2_preference_hidden_states/final_bias_hidden_states.pth")

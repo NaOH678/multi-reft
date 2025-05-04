@@ -26,6 +26,10 @@ llama2_preference_hidden_states/
 baseline/LoRA/lora_output*
 baseline/LoRA/wandb/*
 baseline/LoRA/__pycahce__
+llama2_subspace_hidden_states/
+multi_train/__pycahce__
+baseline/LoRA/wandb/latest-run
+
 
 
 
