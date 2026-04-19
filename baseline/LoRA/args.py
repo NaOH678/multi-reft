@@ -1,9 +1,9 @@
 from dataclasses import dataclass
 from typing import Optional, List
-from transformers import TrainingArguments
+from transformers import TrainingArguments as HFTrainingArguments
 
 @dataclass
-class TrainingArguments(TrainingArguments):
+class TrainingArguments(HFTrainingArguments):
     model_name_or_path: str = "yahma/llama-7b-hf"
     model_max_length: int = 768
     output_dir: str = "./lora_output"
@@ -19,14 +19,15 @@ class TrainingArguments(TrainingArguments):
 
 @dataclass 
 class DataArguments:
-    dataset_name: str = "combined"  # 可选: truthful, helpful, moral, safety, stereotype, toxic, combined
+    dataset_name: str = "combined"  # 可选: truthful, helpful, moral, safety, stereotype, toxicity, combined
     max_samples: Optional[int] = None
     percentage: Optional[float] = None
 
 @dataclass
 class LoRAArguments:
-    lora_rank: int = 8
-    lora_alpha: int = 16
-    lora_dropout: float = 0.1
-    target_modules: List[str] = None  # 需要根据模型结构调整
+    # 为空时表示不启用LoRA，走全参数SFT
+    lora_rank: Optional[int] = None
+    lora_alpha: Optional[int] = None
+    lora_dropout: Optional[float] = None
+    target_modules: Optional[List[str]] = None  # 需要根据模型结构调整
     task_type: str = "CAUSAL_LM"

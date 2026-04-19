@@ -1,5 +1,3 @@
-from alpaca_eval import evaluate, evaluate_from_model
-
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, GenerationConfig, set_seed
 from datasets import load_dataset
@@ -8,17 +6,26 @@ import argparse
 import torch
 import json
 import os
+import sys
+from pathlib import Path
 from peft import PeftModel
 from pyreft import (
     TaskType,
     get_reft_model,
     ReftConfig,
+    SubNodireftIntervention,
     ReftTrainerForCausalLM, 
     ReftDataCollator,
     ReftSupervisedDataset,
     NodireftIntervention,
     LoreftIntervention
 )
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(PROJECT_ROOT))
+
+from multi_train.eval_common.output_naming import build_output_path
 
 
 
@@ -58,12 +65,23 @@ def load_model(args) -> tuple:
         else:
             TARGET_LAYERS = args.target_layers
 
+        # reft_config = ReftConfig(representations=[
+        #     {
+        #         "layer": layer, "component": "block_output",
+        #         "low_rank_dimension": args.subspace_rank,
+        #         "intervention": LoreftIntervention(
+        #         embed_dim=model.config.hidden_size, low_rank_dimension=args.subspace_rank, add_bias=False)
+        #     }
+        #     for layer in TARGET_LAYERS
+        #     ]
+        # )
+
         reft_config = ReftConfig(representations=[
             {
                 "layer": layer, "component": "block_output",
-                "low_rank_dimension": args.subspace_rank,
-                "intervention": LoreftIntervention(
-                embed_dim=model.config.hidden_size, low_rank_dimension=args.subspace_rank, add_bias=False)
+                "intervention": SubNodireftIntervention(
+                    num_total_subspaces=6, subspace_rank=args.subspace_rank, use_residual_gate=True,
+                embed_dim=model.config.hidden_size, low_rank_dimension=args.subspace_rank*6, add_bias=False)
             }
             for layer in TARGET_LAYERS
             ]
@@ -101,14 +119,14 @@ def parse_args():
     return parser.parse_args()
 
 def generate_prompt(instruction, input=None):
-    prompt_no_input_template = """Below is an instruction that \
+    prompt_no_input_template = """<helpful> Below is an instruction that \
 describes a task. Write a response that appropriately \
 completes the request.
 
 ### Instruction:
 %s
 
-### Response:
+### Response:<helpful>
 """
 
     return prompt_no_input_template % instruction
@@ -119,7 +137,7 @@ def main():
     print(args.target_layers)
 
     tokenizer, model = load_model(args)
-    dataset = load_dataset('json', data_files='./dataset/alpaca_eval.json')['train']
+    dataset = load_dataset('json', data_files='../dataset/alpaca_eval.json')['train']
     total = len(dataset)
     
     def generate(
@@ -211,16 +229,17 @@ def main():
     
     decoding = "greedy" if args.greedy_decoding else "no_greedy"
 
-    if not os.path.exists('./multi_train/eval_helpful'):
-        os.mkdir('./multi_train/eval_helpful')
+    output_dir = "./multi_train/eval_helpful"
+    os.makedirs(output_dir, exist_ok=True)
 
-    
-    base_dir = f'multi_train/eval_helpful/{args.base_model.lstrip("../").rstrip("/")}'
-    if args.reft_weights:
-        base_dir += f'_{"-".join(args.reft_weights.split("/")[3:]).strip(" ")}-{decoding}_generations.json'
-    elif args.lora_weights:
-        base_dir += f'_{"-".join(args.lora_weights.split("/")[2:]).strip(" ")}-{decoding}_generations.json'
-    output_path = base_dir
+    output_path = build_output_path(
+        output_dir=output_dir,
+        base_model_path=args.base_model,
+        reft_weights_path=args.reft_weights,
+        lora_weights_path=args.lora_weights,
+        suffix=f"-{decoding}_generations",
+        ext=".json",
+    )
 
     # output_path = f'multi_train/helpfulness/{args.base_model.lstrip("../").rstrip("/")}{"-".join(args.reft_weights.split("/")[2:]).strip(" ").lstrip("-")}{decoding}-generations.json'
     
@@ -257,6 +276,5 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 

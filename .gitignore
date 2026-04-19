@@ -3,13 +3,28 @@
 ./dataset/toxicity_pairwise/data-00000-of-00002.arrow
 ./dataset/toxicity_pairwise/data-00001-of-00002.arrow
 ./dataset/coarse_grained/data-00000-of-00001.arrow
+multi_train/__pycache__
 multi_train/experiment/
 multi_train/experiment-*/
 multi_train/helpfulness/
 multi_train/trainer_out_put/
 multi_train/eval_toxicity/data/user_prompts/nontoxic.jsonl
 multi_train/eval_toxicity/data/user_prompts/toxic.jsonl
+multi_train/eval_toxicity/data
 multi_train/eval_ethics/data/ethics
+multi_train/eval_truth/*.json
+multi_train/eval_truth/summaries
+multi_train/eval_truth/results
+multi_train/eval_truth/generation
+multi_train/eval_bias/data
+multi_train/eval_ethics/data
+multi_train/eval_safety/data
+multi_train/eval_common/__pycahce__
+multi_train/eval_ethics/__pycache__
+multi_train/eval_toxicity/__pycache__
+multi_train/eval_bias/__pycache__
+baseline/LoRA/__pycache__
+multi_train/__pycache__
 dataset/
 crows-pairs/
 tmp/
@@ -26,9 +41,16 @@ llama2_preference_hidden_states/
 baseline/LoRA/lora_output*
 baseline/LoRA/wandb/*
 baseline/LoRA/__pycahce__
+baseline/LoRA/*sft*
+baseline/LoRA/*lora*
+baseline/LoRA/*/*checkpoint*
 llama2_subspace_hidden_states/
 multi_train/__pycahce__
 baseline/LoRA/wandb/latest-run
+trainer_output
+.DS_Store
+=10.1
+
 
 
 

@@ -4,6 +4,7 @@ import argparse
 import os
 import time
 import numpy as np
+from pathlib import Path
 
 import openai
 from tqdm import tqdm
@@ -200,7 +201,7 @@ def main():
 
     args = parse_args()
 
-    reference_output = './dataset/alpaca_eval.json'
+    reference_output = '../dataset/alpaca_eval.json'
     model_output = args.model_output
 
     # 加载参考输出和模型输出
@@ -217,6 +218,14 @@ def main():
             print(f"检测到已有部分结果，准备从中间继续...")
             start_idx = len(merged_data)
             print(f"已完成样本数量：{start_idx}")
+            for idx, (ref_item, model_item) in enumerate(zip(ref_data, model_data)):
+                if idx < start_idx:
+                    continue
+                merged_data.append({
+                    "instruction": ref_item["instruction"],
+                    "model_output": model_item["output"],
+                    "reference_output": ref_item["output"]
+                })
 
     else:
         merged_data = []
@@ -249,8 +258,16 @@ def main():
 
     question_idx_list = list(range(total_len))
     
-    output_review_file = args.model_output.strip('.json') + f'_reviews_{args.api_model}_test.json'
-    partial_file = output_review_file + '_partial.json' if not args.merged_partial_file else args.merged_partial_file
+    model_output_stem = Path(args.model_output).with_suffix("")
+    output_review_file = (
+        model_output_stem.parent
+        / f"{model_output_stem.name}_reviews_{args.api_model}.json"
+    )
+    partial_file = (
+        Path(args.merged_partial_file)
+        if args.merged_partial_file
+        else output_review_file.with_name(f"{output_review_file.stem}_partial.json")
+    )
     
     
     
@@ -395,35 +412,44 @@ def main():
 
     print("全部完成，正在统一计算 win_rate 和 avg_scores...")
 
-    all_scores = []
+    # all_scores = []
+    # for entry in merged_data:
+    #     if 'scores_reverse' in entry:
+    #         try:
+    #             scores = eval(entry['scores_reverse'])
+    #             if isinstance(scores, list) and len(scores) == 2:
+    #                 all_scores.append(scores)
+    #         except Exception as e:
+    #             print(f"解析scores_reverse失败，跳过：{entry.get('instruction', '')[:30]}...")
+    #     elif 'scores' in entry:
+    #         try:
+    #             scores = eval(entry['scores'])
+    #             if isinstance(scores, list) and len(scores) == 2:
+    #                 all_scores.append(scores)
+    #         except Exception as e:
+    #             print(f"解析scores失败，跳过：{entry.get('instruction', '')[:30]}...")
+
+    # scores_array = np.array(all_scores)
+    cnt = 0
+    tie = 0
+    print(merged_data)
     for entry in merged_data:
-        if 'scores_reverse' in entry:
-            try:
-                scores = eval(entry['scores_reverse'])
-                if isinstance(scores, list) and len(scores) == 2:
-                    all_scores.append(scores)
-            except Exception as e:
-                print(f"解析scores_reverse失败，跳过：{entry.get('instruction', '')[:30]}...")
-        elif 'scores' in entry:
-            try:
-                scores = eval(entry['scores'])
-                if isinstance(scores, list) and len(scores) == 2:
-                    all_scores.append(scores)
-            except Exception as e:
-                print(f"解析scores失败，跳过：{entry.get('instruction', '')[:30]}...")
+        if entry['scores'] == 'assistant_1':
+            cnt += 1
+        if entry['scores'] == 'tie':
+            tie += 1
+    win_rate = cnt / (len(merged_data - tie))
+    tie_rate = tie / (len(merged_data))
+    # avg_scores = scores_array.mean(0)
 
-    scores_array = np.array(all_scores)
-    win_rate = (scores_array[:, 0] >= scores_array[:, 1]).sum() / len(all_scores)
-    avg_scores = scores_array.mean(0)
-
-    meta_info['avg_score'] = str(avg_scores.tolist())
+    # meta_info['avg_score'] = str(avg_scores.tolist())
     meta_info['win_rate'] = str(win_rate)
+    meta_info['tie_rate'] = str(tie_rate)
 
     wraped_data['meta_info'] = meta_info
     wraped_data['data'] = merged_data
     
-    output_review_file = args.model_output.strip('.json') + f'_reviews_{args.api_model}.json'
-    with open(f"{output_review_file}", "w") as f:
+    with open(output_review_file, "w") as f:
         json.dump(wraped_data, f, indent=4)
         pass
 
@@ -431,4 +457,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -1,15 +1,16 @@
 import torch
+import pickle
+import numpy as np
 import torch.nn as nn
-import torch.nn.functional as F
+from tqdm import tqdm
+from matplotlib import pyplot as plt
+from sklearn.metrics import accuracy_score
 from torch.utils.data import Dataset, DataLoader
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, TensorDataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from datasets import load_dataset, load_from_disk, concatenate_datasets
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score
-from matplotlib import pyplot as plt
-from tqdm import tqdm
-import numpy as np
-import pickle
 
 
 
@@ -20,12 +21,12 @@ def masked_mean(hidden, mask):
 
 def load_subdataset(subtask):
     dataset_paths = {
-        'truthful': '/data/chaojian/Multi-alignment/dataset/alignment_truthful',
-        'helpful': '/data/chaojian/Multi-alignment/dataset/ultra_feedback.json',
-        'moral': '/data/chaojian/Multi-alignment/dataset/alignment_moral',
-        'safety': '/data/chaojian/Multi-alignment/dataset/alignment_pku_safety',
-        'stereotype': '/data/chaojian/Multi-alignment/dataset/alignment_stereotype',
-        'toxic': '/data/chaojian/Multi-alignment/dataset/alignment_toxic'
+        'truthful': '../../dataset/alignment_truthful_format',
+        'helpful': '../../dataset/ultra_feedback.json',
+        'moral': '../../dataset/alignment_moral_format',
+        'safety': '../../dataset/alignment_pku_safety_format',
+        'stereotype': '../../dataset/alignment_stereotype_format',
+        'toxic': '../../dataset/alignment_toxic_format'
     }
     
     if subtask == 'helpful':
@@ -52,45 +53,40 @@ class TokenizedPromptDataset(Dataset):
 class SimpleClassifier(nn.Module):
     def __init__(self, hidden_size, num_classes):
         super().__init__()
-        self.linear = nn.Linear(hidden_size, num_classes)
+        self.gate = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size * 2, num_classes),
+        )
 
     def forward(self, x):
-        return self.linear(x)
+        return self.gate(x)
     
 
-
-def train_and_eval_classifier(layer_id, device, NUM_EPOCHS, ):
-    from torch.utils.data import DataLoader, TensorDataset
-    from sklearn.model_selection import train_test_split
+def train_and_eval_classifier(layer_id, device, NUM_EPOCHS, saved_dict, input_dim=4096, output_dim=6):
     
-    with open("/data/chaojian/Multi-alignment/llama2_subspace_hidden_states/layer_hidden_states_with_labels.pkl", "rb") as f:
-        saved_dict = pickle.load(f)
-
+    # X_train, y_train = hidden_states[:960].to(device), labels[:960].to(device)
+    # X_test, y_test = hidden_states[960:].to(device), labels[960:].to(device)
     hidden_states = saved_dict[layer_id]["hidden_states"]  # Tensor, shape: (num_samples, hidden_dim)
     labels = saved_dict[layer_id]["labels"]
     # shuffled_labels = labels[torch.randperm(len(labels))]
+    input_dim = hidden_states.shape[1]
+    output_dim = torch.unique(labels).shape[0]
 
     X_train, X_val, y_train, y_val = train_test_split(hidden_states, labels, test_size=0.2, random_state=42)
 
-    # 转换为 PyTorch 张量
-    # X_train = torch.tensor(X_train, dtype=torch.float32)
-    # y_train = torch.tensor(y_train, dtype=torch.long)
-    # X_val = torch.tensor(X_val, dtype=torch.float32)
-    # y_val = torch.tensor(y_val, dtype=torch.long)
-
-    batch_size = 32
+   
+    # batchsize 过大也不行。整个训练集直接训练模型会过拟合
+    batch_size = 64
     train_dataset = TensorDataset(X_train, y_train)
     val_dataset = TensorDataset(X_val, y_val)
 
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
-    # X_train, y_train = hidden_states[:120], labels[:120]
-    # X_test, y_test = hidden_states[120:], labels[120:]
-
-    clf = SimpleClassifier(hidden_states.shape[1], 6).to(device)
+    clf = SimpleClassifier(input_dim, output_dim).to(device)
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(clf.parameters(), lr=1e-3)
+    optimizer = torch.optim.AdamW(clf.parameters(), lr=1e-3, weight_decay=1e-2)
 
 
     for epoch in range(NUM_EPOCHS):
@@ -101,10 +97,10 @@ def train_and_eval_classifier(layer_id, device, NUM_EPOCHS, ):
         for batch in tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}"):
             inputs, labels = batch
             inputs, labels = inputs.to(device), labels.to(device)
-
+            optimizer.zero_grad()
             logits = clf(inputs)
             loss = criterion(logits, labels)
-            optimizer.zero_grad()
+            
             loss.backward()
             optimizer.step()
 
@@ -137,6 +133,8 @@ def train_and_eval_classifier(layer_id, device, NUM_EPOCHS, ):
     # acc = correct / total
     val_accuracy = val_correct_predictions / val_total_samples * 100
     print(f"\nLayer:{layer_id} Validation Accuracy: {val_accuracy:.2f}%\n")
+    print("saving the model...")
+    torch.save(clf.state_dict(), f"../multi_train/trainer_out_put/Llama2-7b-Nodireft_router/{layer_id}_classifier.pth")
     return val_accuracy
 
 def extract_representation():
@@ -148,7 +146,7 @@ def extract_representation():
 
 
     SUBSPACE_NAMES = [
-        'safety', 'toxic', 'helpful', 'moral', 'stereotype', 'truthful', 
+        'safety', 'toxic', 'helpful', #'moral', 'stereotype', 'truthful', 
     ]
 
 
@@ -207,7 +205,7 @@ def extract_representation():
     print(dataset[0])
 
     tokenized_dataset = TokenizedPromptDataset(dataset, SUBSPACE_NAMES)
-    dataloader = DataLoader(tokenized_dataset, batch_size=8, shuffle=True)
+    dataloader = DataLoader(tokenized_dataset, batch_size=32, shuffle=True)
 
     # layers = [0, 6, 12, 18, 24, 30]
 
@@ -238,19 +236,22 @@ def extract_representation():
             "hidden_states": h,
             "labels": labels_tensor
         }
-    with open("/data/chaojian/Multi-alignment/llama2_subspace_hidden_states/layer_hidden_states_with_labels.pkl", "wb") as f:
+    with open(f"../../llama2_subspace_hidden_states/layer_hidden_states_with_labels_3_subspace_{max_examples_each_subspace*3}.pkl", "wb") as f:
         pickle.dump(saved_dict, f)
 
     # torch.save(all_hidden_states, f"/data/chaojian/Multi-alignment/llama2_subspace_hidden_states/subspace_hidden_states.pth")
 
 
-
 def main():
+    
+    with open("../../llama2_subspace_hidden_states/layer_hidden_states_with_labels_18000.pkl", "rb") as f:
+        saved_dict = pickle.load(f)
 
+    
     layers = list(range(33))
     layer_accs = []
     for layer in layers:
-        acc = train_and_eval_classifier(layer, 'cuda:1', 5)
+        acc = train_and_eval_classifier(layer, 'cuda:1', 5, saved_dict)
         layer_accs.append(acc)
 
     plt.plot(layers, layer_accs, marker="o")

@@ -38,6 +38,9 @@ class RouterDataArguments:
     dataset_name: str = field(
         default="helpful", metadata={"help": "Name of the dataset"}
     )
+    ratio: int = field(
+        default=None, metadata={"help": "Ratio of the training data to use"}
+    )
 
 @dataclass
 class RouterModelArguments:

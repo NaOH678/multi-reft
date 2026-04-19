@@ -13,6 +13,7 @@ from pyreft import (
     ReftSupervisedDataset,
     LoreftIntervention,
     NodireftIntervention,
+    SubNodireftIntervention,
     NoreftIntervention,
     ReftTrainer,
     ReftTrainerForCausalLMDistributed
@@ -21,36 +22,6 @@ import torch.distributed as dist
 import wandb
 import os
 
-class SubloreftIntervention(LoreftIntervention):
-    """
-    This is a LoReFT that supports subspace interventions!
-    """
-    def forward(
-        self, base, source=None, subspaces=None
-    ):
-        assert subspaces is not None
-        output = []
-        
-        rotated_base = self.rotate_layer(base)
-        diff = self.act_fn(self.learned_source(base)) - rotated_base
-        
-        batched_subspace = []
-        batched_weights = []
-        
-        for example_i in range(len(subspaces)):
-            LHS = (diff[example_i, :, subspaces[example_i]])
-            RHS = self.rotate_layer.weight[..., subspaces[example_i]].T
-            # print(diff.shape, LHS.shape, RHS.shape, base.shape, subspaces)
-            batched_subspace += [LHS]
-            batched_weights += [RHS]
-
-        
-        batched_subspace = torch.stack(batched_subspace, dim=0)
-        batched_weights = torch.stack(batched_weights, dim=0)
-
-        output = base + torch.bmm(batched_subspace, batched_weights)
-
-        return self.dropout(output.to(base.dtype))
 
 
 
@@ -60,8 +31,9 @@ if __name__== "__main__":
     rank = accelerator.process_index
 
     SUBSPACE_NAMES = [
-    'ethic', 'truth', 'safety', 'toxicity', 'stereotype', 'helpfulness'
+        'truthful','toxicity', 'stereotype', 'safety', 'moral',
     ]
+    SUBTASK_ALIASES = {"toxic": "toxicity", "combine": "combined"}
 
 
     parser = HfArgumentParser(
@@ -94,7 +66,25 @@ if __name__== "__main__":
     tokenizer = AutoTokenizer.from_pretrained(
         model_name_or_path, model_max_length=model_max_length, 
         padding_side="right", use_fast=False)
-    tokenizer.pad_token = tokenizer.unk_token
+    # Avoid using EOS as PAD; otherwise EOS tokens may be masked out in attention.
+    added_pad_token = False
+    if tokenizer.pad_token is None:
+        if tokenizer.unk_token is not None:
+            tokenizer.pad_token = tokenizer.unk_token
+        else:
+            tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+            added_pad_token = True
+    if added_pad_token:
+        model.resize_token_embeddings(len(tokenizer))
+
+    # Keep model/generation configs aligned with tokenizer to avoid repeated warnings.
+    model.config.pad_token_id = tokenizer.pad_token_id
+    model.config.bos_token_id = tokenizer.bos_token_id
+    model.config.eos_token_id = tokenizer.eos_token_id
+    if getattr(model, "generation_config", None) is not None:
+        model.generation_config.pad_token_id = tokenizer.pad_token_id
+        model.generation_config.bos_token_id = tokenizer.bos_token_id
+        model.generation_config.eos_token_id = tokenizer.eos_token_id
 
 
     # load data
@@ -106,32 +96,105 @@ if __name__== "__main__":
         percentage = data_args.percentage
 
     
-    subtask = reftargs.subtask
-    if subtask == 'truthful':
-        data = load_from_disk('/data/chaojian/Multi-alignment/dataset/alignment_truthful')['train']
-        # truthful_data = truthful_data.select(range(min(max_samples, len(truthful_data))))
+    truthful_trigger = "the correct answer is "
+    ethics_trigger =  "the action is "
 
-    elif subtask == 'helpful':
-        data = load_dataset('json',data_files='/data/chaojian/Multi-alignment/dataset/ultra_feedback.json')['train']
-        # helpful_data = helpful_data.select(range(min(max_samples, len(helpful_data))))
-    
-    elif subtask == 'moral':
-        data = load_from_disk('/data/chaojian/Multi-alignment/dataset/alignment_moral')['train']
-        # moral_data = moral_data.select(range(min(max_samples, len(moral_data))))
-    
-    elif subtask == 'safety':
-        data = load_from_disk('/data/chaojian/Multi-alignment/dataset/alignment_pku_safety')['train']
-        # safety_data = safety_data.select(range(min(max_samples, len(safety_data))))
-    
-    elif subtask == 'stereotype':
-        data = load_from_disk('/data/chaojian/Multi-alignment/dataset/alignment_stereotype')['train']
-        # stereotype_data = stereotype_data.select(range(min(max_samples, len(stereotype_data))))
-    
-    elif subtask == 'toxic':
-        data = load_from_disk('/data/chaojian/Multi-alignment/dataset/alignment_toxic')['train']
-        # toxicity_data = toxicity_data.select(range(min(max_samples, len(toxicity_data))))
-    
-    # data = data.select(range(min(max_samples, len(data))))
+    def _format_truthful_output(example):
+        answer = example["answer"] if "answer" in example and example["answer"] is not None else example["output"]
+        answer = str(answer).strip()
+        output = str(example["output"]).strip()
+        if not output.lower().startswith(truthful_trigger):
+            output = f"{truthful_trigger}{answer}"
+        return output
+
+    def _format_ethics_out(example):
+        answer = example["answer"] if "answer" in example and example["answer"] is not None else example["output"]
+        answer = str(answer).strip()
+        output = str(example["output"]).strip()
+        if not output.lower().startswith(ethics_trigger):
+            output = f"{ethics_trigger}{answer}"
+        return output
+
+    def _canonicalize_subtask(subtask_name):
+        normalized = (subtask_name or "").strip().lower()
+        return SUBTASK_ALIASES.get(normalized, normalized)
+
+    def _prepare_subtask_dataset(subtask_name, include_truth_mix_for_stereotype=True):
+        if subtask_name == 'truthful':
+            dataset = load_from_disk('./dataset/alignment_truthful_format')['train']
+
+        elif subtask_name == 'moral':
+            dataset = load_from_disk('./dataset/alignment_moral_cls')
+
+        elif subtask_name == 'safety':
+            dataset = load_from_disk('./dataset/alignment_pku_safety_format')['train']
+
+        elif subtask_name == 'stereotype':
+            stereotype_data = load_from_disk('./dataset/alignment_stereotype_format')['train']
+            if include_truth_mix_for_stereotype:
+                truthful_data = load_from_disk('./dataset/alignment_truthful_format')['train']
+                truthful_data = truthful_data.shuffle(seed=training_args.seed)
+                truthful_data = truthful_data.select(range(min(5000, len(truthful_data))))
+                truthful_data = truthful_data.map(lambda x: {"output": _format_truthful_output(x)})
+
+                # Keep only shared columns so concatenate_datasets can merge safely.
+                common_columns = [col for col in stereotype_data.column_names if col in truthful_data.column_names]
+                stereotype_data = stereotype_data.remove_columns(
+                    [col for col in stereotype_data.column_names if col not in common_columns]
+                )
+                truthful_data = truthful_data.remove_columns(
+                    [col for col in truthful_data.column_names if col not in common_columns]
+                )
+                dataset = concatenate_datasets([stereotype_data, truthful_data])
+            else:
+                dataset = stereotype_data
+
+        elif subtask_name == 'toxicity':
+            dataset = load_from_disk('./dataset/alignment_toxic_format')['train']
+
+        else:
+            raise ValueError(
+                f"Unsupported subtask: {subtask_name}. Allowed: {SUBSPACE_NAMES + ['combined']}"
+            )
+
+        subspace_label_id = SUBSPACE_NAMES.index(subtask_name)
+        # Align truthful formatting with LoReFT commonsense setup:
+        # target text should include trigger tokens, not only "endingX".
+        if subtask_name == "truthful":
+            def _prepare_truthful(example):
+                output = _format_truthful_output(example)
+                return {
+                    "output": output,
+                    "subspace_labels": subspace_label_id,
+                }
+
+            dataset = dataset.map(_prepare_truthful)
+
+        elif subtask_name == 'moral':
+            def _prepare_ethics(example):
+                output = _format_ethics_out(example)
+                return {
+                    "output": output,
+                    "subspace_labels": subspace_label_id,
+                }
+
+            dataset = dataset.map(_prepare_ethics)
+
+        else:
+            dataset = dataset.map(lambda x: {"subspace_labels": subspace_label_id})
+
+        return dataset
+
+    subtask = _canonicalize_subtask(reftargs.subtask)
+    if subtask == "combined":
+        datasets = [
+            _prepare_subtask_dataset(name, include_truth_mix_for_stereotype=False)
+            for name in SUBSPACE_NAMES
+        ]
+        data = concatenate_datasets(datasets).shuffle(seed=training_args.seed)
+    else:
+        data = _prepare_subtask_dataset(subtask, include_truth_mix_for_stereotype=True)
+
     print(data[0])
     
 
@@ -142,7 +205,7 @@ if __name__== "__main__":
     # safety_data = safety_data.map(lambda x: {"subspaces": SUBSPACES['safety']})
     # stereotype_data = stereotype_data.map(lambda x: {"subspaces": SUBSPACES['stereotype']})
     # toxicity_data = toxicity_data.map(lambda x: {"subspaces": SUBSPACES['toxicity']})
-    data = data.map(lambda x: {"subspaces": SUBSPACES['truth']})
+    # data = data.map(lambda x: {"subspaces": SUBSPACES['truth']})
 
     
     # subspace_dataset = concatenate_datasets([helpful_data, 
@@ -177,7 +240,7 @@ if __name__== "__main__":
     reft_config = ReftConfig(representations=[
         {
             "layer": layer, "component": "block_output",
-            "intervention": NodireftIntervention(
+            "intervention": LoreftIntervention(
             embed_dim=model.config.hidden_size, 
             low_rank_dimension=reftargs.subspace_rank, 
             dropout=training_args.dropout,
@@ -190,15 +253,20 @@ if __name__== "__main__":
     reft_model = get_reft_model(model, reft_config)
     reft_model.print_trainable_parameters()
 
+    if data_args.max_samples:
+        max_examples = data_args.max_samples
+    else:
+        max_examples = len(data)
+
 
     train_dataset = ReftSupervisedDataset(
-        "Nodireloreft", None, tokenizer, dataset=subspace_dataset,
+        "Loreft", None, tokenizer, dataset=subspace_dataset,
         **{"num_interventions": len(reft_model.interventions), "position": reftargs.position , "share_weights": True},          # 该成f1+l1 梯度是0？？？？
-        input_field=None, instruction_field="input", output_field="full_output", 
-        seed=training_args.seed, max_n_example=min(data_args.max_samples, len(data)),
+        input_field='input', instruction_field="instruction", output_field="output", 
+        seed=training_args.seed, max_n_example=min(max_examples, len(data)),
         no_stop=False
     )
-    print(train_dataset[0])
+    print(train_dataset[:5])
 
 
     data_collator_fn = transformers.DataCollatorForSeq2Seq(
@@ -211,7 +279,7 @@ if __name__== "__main__":
 
     if rank == 0:
         # os.environ["WANDB_MODE"] = "offline"  # 如果你用 online 模式可以去掉这一行
-        wandb.init(project=f"Reft_{reftargs.subtask}", name=f"first_train_{reftargs.subtask}")
+        wandb.init(project=f"NodireftwithSubtoken_{reftargs.subtask}", name=f"first_train_{reftargs.subtask}")
         print(torch.cuda.device_count())
         wandb.log(dict(
             num_gpus=torch.cuda.device_count(),
@@ -225,8 +293,18 @@ if __name__== "__main__":
             dropout=training_args.dropout,
             subspace_rank=reftargs.subspace_rank,
             target_layers=reftargs.target_layers,
-            seed=training_args.seed
+            seed=training_args.seed,
         ))     
+
+    resume_from_checkpoint = getattr(training_args, "resume_from_checkpoint", None)
+    if isinstance(resume_from_checkpoint, str):
+        normalized_resume = resume_from_checkpoint.strip()
+        if normalized_resume == "":
+            resume_from_checkpoint = None
+        elif normalized_resume.lower() in {"true", "auto", "latest"}:
+            resume_from_checkpoint = True
+        else:
+            resume_from_checkpoint = normalized_resume
 
     training_args = transformers.TrainingArguments(
         num_train_epochs=training_args.num_train_epochs, 
@@ -241,21 +319,55 @@ if __name__== "__main__":
         save_total_limit=10,
         save_strategy=training_args.save_strategy,
         weight_decay=training_args.weight_decay,
-        seed=training_args.seed
+        seed=training_args.seed,
+        dataloader_num_workers=8,
+        lr_scheduler_type=training_args.lr_scheduler_type,
+  
     )
-
     
+
     trainer =ReftTrainerForCausalLMDistributed(
         model=reft_model, 
         tokenizer=tokenizer, 
         args=training_args, 
         train_dataset=train_dataset, 
-        eval_dataset=None, 
         data_collator=data_collator
     )
+    if rank == 0:
+        print("remove_unused_columns =", training_args.remove_unused_columns)
+
+    # 先构 dataloader 看真实喂给模型的 batch
+    dl = trainer.get_train_dataloader()
+    batch = next(iter(dl))
+
+    if rank == 0:
+        print("batch keys =", list(batch.keys()))
+        print("intervention_locations shape =", batch["intervention_locations"].shape)
+        sup_counts = (batch["labels"] != -100).sum(dim=1)
+        print("supervised tokens per sample (first 8) =", sup_counts[:8].tolist())
+
+        i = 0
+        target_ids = batch["labels"][i][batch["labels"][i] != -100]
+        print("sample0 target_len =", target_ids.numel())
+        print("sample0 target_text =", tokenizer.decode(target_ids.tolist()))
+    if rank == 0:
+        import numpy as np
+        counts = []
+        n = min(500, len(train_dataset))
+        for i in range(n):
+            counts.append(int((train_dataset[i]["labels"] != -100).sum().item()))
+        print("target token stats over", n, "samples:",
+            {"p10": float(np.percentile(counts, 10)),
+            "p50": float(np.percentile(counts, 50)),
+            "p90": float(np.percentile(counts, 90)),
+            "mean": float(np.mean(counts))})
     if dist.is_initialized():
         dist.barrier()
     
-    trainer.train(resume_from_checkpoint=False)
+    if resume_from_checkpoint:
+        if rank == 0:
+            print(f"Resuming training from checkpoint: {resume_from_checkpoint}")
+        trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+    else:
+        trainer.train()
     trainer.save_state()
-
