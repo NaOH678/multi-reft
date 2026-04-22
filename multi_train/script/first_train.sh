@@ -3,7 +3,7 @@ export WANDB_MODE="${WANDB_MODE:-offline}"
 
 accelerate launch --num_processes=8 multi_train/train.py \
     --output_dir "multi_train/trainer_output/Llama3-8b-Loreft_${subspace}" \
-    --model_name_or_path ../weightsft/models/llama3-8b/snapshots/8cde5ca8380496c9a6cc7ef3a8b46a0372a1d920 \
+    --model_name_or_path ../models/llama3-8b/snapshots/8cde5ca8380496c9a6cc7ef3a8b46a0372a1d920 \
     --per_device_train_batch_size 16 \
     --subspace_rank 8 \
     --warmup_ratio 0.0125 \

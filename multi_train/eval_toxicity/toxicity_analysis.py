@@ -7,6 +7,8 @@ import pandas as pd
 
 
 TASK_KEY_SEP = "|"
+DETOXIFY_CHECKPOINT = "/mnt/petrelfs/shichaojian/.cache/torch/hub/checkpoints/toxic_original-c1212f89.ckpt"
+DETOXIFY_CONFIG_PATH = "/mnt/petrelfs/shichaojian/.cache/huggingface/bert-base-uncased"
 
 
 def _to_float(value):
@@ -21,9 +23,10 @@ def _load_detoxify_model(detoxify_model_name="original", device=None):
             "Detoxify is required for toxicity analysis. Install with `pip install detoxify`."
         ) from exc
 
-    kwargs = {}
-    # kwargs["checkpoint"] = "~/.cache/torch/hub/checkpoints/toxic_original-c1212f89.ckpt"
-    # kwargs["huggingface_config_path"]="~/.cache/huggingface/hub/models--bert-base-uncased/snapshots/86b5e0934494bd15c9632b12f734a8a67f723594/"
+    kwargs = {
+        "checkpoint": DETOXIFY_CHECKPOINT,
+        "huggingface_config_path": DETOXIFY_CONFIG_PATH,
+    }
     if device:
         kwargs["device"] = device
     return Detoxify(detoxify_model_name, **kwargs)
