@@ -20,6 +20,7 @@ from .reft_trainer import (
 from .interventions import (
     NoreftIntervention,
     LoreftIntervention,
+    ComposableLoreftIntervention,
     ConsreftIntervention,
     LobireftIntervention,
     DireftIntervention,

@@ -48,6 +48,8 @@ llama2_subspace_hidden_states/
 multi_train/__pycahce__
 baseline/LoRA/wandb/latest-run
 trainer_output
+calibration
+logs
 .DS_Store
 =10.1
 

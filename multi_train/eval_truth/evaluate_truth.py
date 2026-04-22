@@ -7,14 +7,24 @@ import argparse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List
-from pyreft import (
-    TaskType,
-    get_reft_model,
-    ReftConfig,
-    LoreftIntervention,
-    SubNodireftIntervention,
-    NodireftIntervention
-)
+try:
+    from pyreft import (
+        TaskType,
+        get_reft_model,
+        ReftConfig,
+        LoreftIntervention,
+        SubNodireftIntervention,
+        NodireftIntervention
+    )
+except ImportError:
+    from pyreft.pyreft import (
+        TaskType,
+        get_reft_model,
+        ReftConfig,
+        LoreftIntervention,
+        SubNodireftIntervention,
+        NodireftIntervention
+    )
 # import fire
 
 import torch
@@ -30,6 +40,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from multi_train.eval_common.output_naming import build_output_path
 from multi_train.eval_common.output_naming import build_model_tag
+from multi_train.eval_common.composable_loreft import (
+    build_composable_model_tag,
+    load_composed_reft_model,
+    normalize_specialist_label,
+)
 
 def str2bool(v):
     if isinstance(v, bool):
@@ -43,6 +58,159 @@ def str2bool(v):
     raise argparse.ArgumentTypeError("Boolean value expected.")
 
 
+def _unwrap_intervention(intervention_value):
+    if isinstance(intervention_value, (list, tuple)):
+        return intervention_value[0]
+    return intervention_value
+
+
+def _init_debug_accumulator(model, specialist_labels):
+    if model is None or not hasattr(model, "interventions"):
+        return None
+
+    accumulator = {
+        "specialist_labels": specialist_labels,
+        "layers": {},
+    }
+
+    for layer_key, intervention_value in model.interventions.items():
+        intervention = _unwrap_intervention(intervention_value)
+        if not hasattr(intervention, "latest_alpha"):
+            continue
+        accumulator["layers"][str(layer_key)] = {
+            "alpha_sum": None,
+            "alpha_sq_sum": None,
+            "normalized_score_sum": None,
+            "normalized_score_sq_sum": None,
+            "delta_norm_sum": None,
+            "delta_norm_sq_sum": None,
+            "intervention_norm_sum": None,
+            "intervention_norm_sq_sum": None,
+            "count": 0,
+        }
+
+    return accumulator
+
+
+def _update_debug_accumulator(accumulator, model):
+    if accumulator is None:
+        return
+
+    for layer_key, intervention_value in model.interventions.items():
+        layer_name = str(layer_key)
+        if layer_name not in accumulator["layers"]:
+            continue
+
+        intervention = _unwrap_intervention(intervention_value)
+        alpha = getattr(intervention, "latest_alpha", None)
+        normalized_score = getattr(intervention, "latest_normalized_score", None)
+        delta_norm = getattr(intervention, "latest_delta_norm", None)
+        intervention_norm = getattr(intervention, "latest_intervention_norm", None)
+        if alpha is None or delta_norm is None or intervention_norm is None:
+            continue
+
+        alpha = alpha.float()
+        normalized_score = normalized_score.float() if normalized_score is not None else None
+        delta_norm = delta_norm.float()
+        intervention_norm = intervention_norm.float()
+
+        layer_stats = accumulator["layers"][layer_name]
+        alpha_sum = alpha.sum(dim=(0, 1))
+        alpha_sq_sum = (alpha ** 2).sum(dim=(0, 1))
+        normalized_score_sum = normalized_score.sum(dim=(0, 1)) if normalized_score is not None else None
+        normalized_score_sq_sum = (normalized_score ** 2).sum(dim=(0, 1)) if normalized_score is not None else None
+        delta_sum = delta_norm.sum(dim=(0, 1))
+        delta_sq_sum = (delta_norm ** 2).sum(dim=(0, 1))
+        intv_sum = intervention_norm.sum(dim=(0, 1))
+        intv_sq_sum = (intervention_norm ** 2).sum(dim=(0, 1))
+        count = int(alpha.shape[0] * alpha.shape[1])
+
+        if layer_stats["alpha_sum"] is None:
+            layer_stats["alpha_sum"] = alpha_sum
+            layer_stats["alpha_sq_sum"] = alpha_sq_sum
+            layer_stats["normalized_score_sum"] = normalized_score_sum
+            layer_stats["normalized_score_sq_sum"] = normalized_score_sq_sum
+            layer_stats["delta_norm_sum"] = delta_sum
+            layer_stats["delta_norm_sq_sum"] = delta_sq_sum
+            layer_stats["intervention_norm_sum"] = intv_sum
+            layer_stats["intervention_norm_sq_sum"] = intv_sq_sum
+        else:
+            layer_stats["alpha_sum"] += alpha_sum
+            layer_stats["alpha_sq_sum"] += alpha_sq_sum
+            if normalized_score_sum is not None:
+                if layer_stats["normalized_score_sum"] is None:
+                    layer_stats["normalized_score_sum"] = normalized_score_sum
+                    layer_stats["normalized_score_sq_sum"] = normalized_score_sq_sum
+                else:
+                    layer_stats["normalized_score_sum"] += normalized_score_sum
+                    layer_stats["normalized_score_sq_sum"] += normalized_score_sq_sum
+            layer_stats["delta_norm_sum"] += delta_sum
+            layer_stats["delta_norm_sq_sum"] += delta_sq_sum
+            layer_stats["intervention_norm_sum"] += intv_sum
+            layer_stats["intervention_norm_sq_sum"] += intv_sq_sum
+
+        layer_stats["count"] += count
+
+
+def _finalize_debug_accumulator(accumulator):
+    if accumulator is None:
+        return None
+
+    specialist_labels = accumulator.get("specialist_labels", [])
+    finalized = {
+        "specialist_labels": specialist_labels,
+        "layers": {},
+    }
+
+    for layer_name, stats in accumulator["layers"].items():
+        count = int(stats["count"])
+        if count <= 0 or stats["alpha_sum"] is None:
+            continue
+
+        alpha_mean = stats["alpha_sum"] / count
+        alpha_var = (stats["alpha_sq_sum"] / count) - alpha_mean.pow(2)
+        alpha_std = torch.sqrt(torch.clamp(alpha_var, min=0.0))
+
+        delta_mean = stats["delta_norm_sum"] / count
+        delta_var = (stats["delta_norm_sq_sum"] / count) - delta_mean.pow(2)
+        delta_std = torch.sqrt(torch.clamp(delta_var, min=0.0))
+
+        intv_mean = stats["intervention_norm_sum"] / count
+        intv_var = (stats["intervention_norm_sq_sum"] / count) - intv_mean.pow(2)
+        intv_std = torch.sqrt(torch.clamp(intv_var, min=0.0))
+        normalized_score_mean = None
+        normalized_score_std = None
+        if stats["normalized_score_sum"] is not None:
+            normalized_score_mean = stats["normalized_score_sum"] / count
+            normalized_score_var = (stats["normalized_score_sq_sum"] / count) - normalized_score_mean.pow(2)
+            normalized_score_std = torch.sqrt(torch.clamp(normalized_score_var, min=0.0))
+
+        per_specialist = []
+        for idx in range(alpha_mean.shape[0]):
+            label = specialist_labels[idx] if idx < len(specialist_labels) else f"specialist_{idx}"
+            entry = {
+                "index": idx,
+                "label": label,
+                "alpha_mean": float(alpha_mean[idx].item()),
+                "alpha_std": float(alpha_std[idx].item()),
+                "delta_norm_mean": float(delta_mean[idx].item()),
+                "delta_norm_std": float(delta_std[idx].item()),
+                "intervention_norm_mean": float(intv_mean[idx].item()),
+                "intervention_norm_std": float(intv_std[idx].item()),
+            }
+            if normalized_score_mean is not None:
+                entry["normalized_score_mean"] = float(normalized_score_mean[idx].item())
+                entry["normalized_score_std"] = float(normalized_score_std[idx].item())
+            per_specialist.append(entry)
+
+        finalized["layers"][layer_name] = {
+            "count": count,
+            "per_specialist": per_specialist,
+        }
+
+    return finalized
+
+
 def main(
         load_8bit: bool = False,
         base_model: str = "",
@@ -52,8 +220,17 @@ def main(
     args = parse_args()
     args.reft_weights = args.reft_weights or None
     args.lora_weights = args.lora_weights or None
+    if args.reft_specialists:
+        args.reft_specialists = [path for path in args.reft_specialists if str(path).strip()]
+        if len(args.reft_specialists) == 0:
+            args.reft_specialists = None
     if args.reft_weights and args.lora_weights:
         raise ValueError("`reft_weights` and `lora_weights` cannot be used at the same time.")
+    if args.reft_specialists and args.reft_weights:
+        raise ValueError("`reft_specialists` and `reft_weights` cannot be used at the same time.")
+    if args.reft_specialists and args.lora_weights:
+        raise ValueError("`reft_specialists` and `lora_weights` cannot be used at the same time.")
+    use_reft = bool(args.reft_weights or args.reft_specialists)
 
     
     if torch.cuda.is_available():
@@ -84,7 +261,7 @@ def main(
         tokenizer.padding_side = "left"
         inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(device)
 
-        if args.reft_weights:
+        if use_reft:
             base_unit_location = inputs["input_ids"].shape[-1] - 1
             shift = inputs["attention_mask"].argmax(dim=1).unsqueeze(1)
             l = positions
@@ -157,14 +334,40 @@ def main(
     output_dir = "./multi_train/eval_truth"
     os.makedirs(output_dir, exist_ok=True)
 
-    save_file = build_output_path(
-        output_dir=output_dir,
-        base_model_path=args.base_model,
-        reft_weights_path=args.reft_weights,
-        lora_weights_path=args.lora_weights,
-        suffix=f"-{args.dataset}",
-        ext=".json",
-    )
+    if args.reft_specialists:
+        specialist_labels = [normalize_specialist_label(path) for path in args.reft_specialists]
+        model_tag = build_composable_model_tag(
+            base_model_path=args.base_model,
+            specialist_dirs=args.reft_specialists,
+            compose_domain=args.compose_domain,
+            composition_method=args.composition_method,
+            composition_temperature=args.composition_temperature,
+            composition_topk=args.composition_topk,
+            compat_threshold=args.compat_threshold,
+            single_index=args.single_index,
+            shared_basis_type=args.shared_basis_type,
+            shared_basis_rank=args.shared_basis_rank,
+            transport_type=args.transport_type,
+            score_normalizer=args.score_normalizer,
+            score_stats_path=args.score_stats_path,
+            score_clip=args.score_clip,
+        )
+        save_file = str(Path(output_dir) / f"{model_tag}-{args.dataset}.json")
+    else:
+        specialist_labels = []
+        model_tag = build_model_tag(
+            base_model_path=args.base_model,
+            reft_weights_path=args.reft_weights,
+            lora_weights_path=args.lora_weights,
+        )
+        save_file = build_output_path(
+            output_dir=output_dir,
+            base_model_path=args.base_model,
+            reft_weights_path=args.reft_weights,
+            lora_weights_path=args.lora_weights,
+            suffix=f"-{args.dataset}",
+            ext=".json",
+        )
     if args.summary_file:
         summary_file = args.summary_file
     else:
@@ -175,6 +378,7 @@ def main(
     dataset = load_data(args)
     batches = create_batch(dataset, args.batch_size)
     tokenizer, model = load_model(args)
+    debug_accumulator = _init_debug_accumulator(model, specialist_labels)
     total = len(batches)
     correct = 0
     current = 0
@@ -185,6 +389,7 @@ def main(
         instructions = [data.get('instruction') for data in batch]
 
         outputs = evaluate(instructions)
+        _update_debug_accumulator(debug_accumulator, model)
 
         for data, output in zip(batch, outputs):
             label = data.get('answer')
@@ -212,6 +417,15 @@ def main(
     print('\n')
     print('test finished')
 
+    debug_summary = _finalize_debug_accumulator(debug_accumulator)
+    debug_summary_file = None
+    if debug_summary is not None:
+        save_path = Path(save_file)
+        debug_summary_file = str(save_path.with_name(f"{save_path.stem}_debug_summary.json"))
+        with open(debug_summary_file, "w") as f:
+            json.dump(debug_summary, f, indent=4)
+        print(f"Debug summary saved to: {debug_summary_file}")
+
     accuracy = (correct / current) if current > 0 else 0.0
     summary = {
         "dataset": args.dataset,
@@ -224,11 +438,38 @@ def main(
         "base_model": args.base_model,
         "reft_weights": args.reft_weights,
         "lora_weights": args.lora_weights,
-        "model_tag": build_model_tag(
-            base_model_path=args.base_model,
-            reft_weights_path=args.reft_weights,
-            lora_weights_path=args.lora_weights,
-        ),
+        "reft_specialists": args.reft_specialists,
+        "compose_domain": args.compose_domain,
+        "composition_method": args.composition_method,
+        "composition_temperature": args.composition_temperature,
+        "composition_topk": args.composition_topk,
+        "compat_threshold": args.compat_threshold,
+        "single_index": args.single_index,
+        "shared_basis_type": args.shared_basis_type,
+        "shared_basis_rank": args.shared_basis_rank,
+        "transport_type": args.transport_type,
+        "score_normalizer": args.score_normalizer,
+        "score_stats_path": args.score_stats_path,
+        "score_eps": args.score_eps,
+        "score_clip": args.score_clip,
+        "composable_config": {
+            "specialist_labels": specialist_labels,
+            "compose_domain": args.compose_domain,
+            "composition_method": args.composition_method,
+            "composition_temperature": args.composition_temperature,
+            "composition_topk": args.composition_topk,
+            "compat_threshold": args.compat_threshold,
+            "single_index": args.single_index,
+            "shared_basis_type": args.shared_basis_type,
+            "shared_basis_rank": args.shared_basis_rank,
+            "transport_type": args.transport_type,
+            "score_normalizer": args.score_normalizer,
+            "score_stats_path": args.score_stats_path,
+            "score_eps": args.score_eps,
+            "score_clip": args.score_clip,
+        } if args.reft_specialists else None,
+        "debug_summary_file": debug_summary_file,
+        "model_tag": model_tag,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
     summary_path = Path(summary_file)
@@ -289,12 +530,26 @@ def parse_args():
     # parser.add_argument('--model', choices=['LLaMA-7B', "LLaMA-13B",'BLOOM-7B', 'GPT-j-6B'], required=True)
     # parser.add_argument('--adapter', choices=['LoRA', 'AdapterP', 'AdapterH', 'Parallel'],
     #                     required=True)
-    parser.add_argument('--target_layers', type=int, nargs='+')
+    parser.add_argument('--target_layers', type=int, nargs='+', default=[-1])
     parser.add_argument('--subspace_rank', type=int, default=4)
     parser.add_argument('--base_model', required=True)
     parser.add_argument('--batch_size', type=int, required=True)
     parser.add_argument('--reft_weights', type=str,default=None)
+    parser.add_argument('--reft_specialists', type=str, nargs='+', default=None)
     parser.add_argument('--lora_weights', type=str,default=None)
+    parser.add_argument('--compose_domain', choices=["output", "projected_output", "shared_latent"], default="output")
+    parser.add_argument('--composition_method', choices=["single", "equal", "residual_softmax", "residual_scaled_softmax", "residual_logz_softmax", "intervention_softmax", "topk_residual", "compat_filtered_topk"], default="equal")
+    parser.add_argument('--composition_temperature', type=float, default=1.0)
+    parser.add_argument('--composition_topk', type=int, default=None)
+    parser.add_argument('--compat_threshold', type=float, default=0.0)
+    parser.add_argument('--single_index', type=int, default=None)
+    parser.add_argument('--shared_basis_type', choices=["orth_mean", "svd_union"], default=None)
+    parser.add_argument('--shared_basis_rank', type=int, default=None)
+    parser.add_argument('--transport_type', choices=["identity", "overlap"], default=None)
+    parser.add_argument('--score_normalizer', choices=["none", "mean_ratio", "log_zscore"], default="none")
+    parser.add_argument('--score_stats_path', type=str, default=None)
+    parser.add_argument('--score_eps', type=float, default=1e-6)
+    parser.add_argument('--score_clip', type=float, default=None)
     parser.add_argument('--positions', type=int, default=5)
     parser.add_argument('--greedy_decoding', type=str2bool, nargs='?', const=True, default=False)
     parser.add_argument('--load_8bit', action='store_true', default=False)
@@ -323,6 +578,8 @@ def load_model(args) -> tuple:
         print(f'can not find reft weight, the value is: {reft_weights}')
     else:
         print(f'load reft weight: {reft_weights}')
+    if args.reft_specialists:
+        print(f'load reft specialists: {args.reft_specialists}')
     lora_weight = args.lora_weights
     if not lora_weight:
         print(f'can not find lora weight, the value is: {lora_weight}')
@@ -357,7 +614,31 @@ def load_model(args) -> tuple:
         model.generation_config.bos_token_id = tokenizer.bos_token_id
         model.generation_config.eos_token_id = tokenizer.eos_token_id
    
-    if reft_weights:
+    if args.reft_specialists:
+        if args.target_layers == [-1]:
+            target_layers = list(range(len(model.model.layers)))
+        else:
+            target_layers = args.target_layers
+
+        model = load_composed_reft_model(
+            model=model,
+            specialist_dirs=args.reft_specialists,
+            target_layers=target_layers,
+            compose_domain=args.compose_domain,
+            composition_method=args.composition_method,
+            composition_temperature=args.composition_temperature,
+            composition_topk=args.composition_topk,
+            compat_threshold=args.compat_threshold,
+            single_index=args.single_index,
+            shared_basis_type=args.shared_basis_type,
+            shared_basis_rank=args.shared_basis_rank,
+            transport_type=args.transport_type,
+            score_normalizer=args.score_normalizer,
+            score_stats_path=args.score_stats_path,
+            score_eps=args.score_eps,
+            score_clip=args.score_clip,
+        )
+    elif reft_weights:
         if args.target_layers == [-1]:
             TARGET_LAYERS = list(range(len(model.model.layers)))
         else:
