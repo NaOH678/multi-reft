@@ -58,7 +58,8 @@ if __name__== "__main__":
     model_name_or_path = training_args.model_name_or_path # yahma/llama-7b-hf or yahma/llama-13b-hf
     model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path, 
-        torch_dtype=torch.bfloat16
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2"
     )
 
     # get tokenizer
