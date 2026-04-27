@@ -122,6 +122,8 @@ class ComposableLoreftIntervention(
         self.shared_basis_type = kwargs.get("shared_basis_type")
         self.shared_basis_rank = kwargs.get("shared_basis_rank")
         self.transport_type = kwargs.get("transport_type")
+        self.score_source = kwargs.get("score_source")
+        self.score_stats_source = kwargs.get("score_stats_source")
         self.score_normalizer = kwargs.get("score_normalizer", "none")
         self.score_eps = float(kwargs.get("score_eps", 1e-6))
         score_clip = kwargs.get("score_clip", None)
@@ -190,8 +192,13 @@ class ComposableLoreftIntervention(
         self.latest_intervention_norm = None
         self.latest_pairwise_cos = None
         self.latest_selected_mask = None
+        self.latest_topk_mask = None
+        self.latest_rejected_conflict_mask = None
+        self.latest_conflict_pair_mask = None
         self.latest_conflict_score = None
         self.latest_compose_domain = None
+        self.latest_score_source = None
+        self.latest_score_stats_source = None
         self.latest_shared_basis_stats = None
         self.latest_transport_stats = None
 
@@ -269,24 +276,37 @@ class ComposableLoreftIntervention(
         denom = alpha.sum(dim=-1, keepdim=True).clamp_min(1e-6)
         return alpha / denom
 
-    def _normalize_delta_scores(self, delta_norm, mode=None):
+    def _resolve_score_source(self, explicit_source=None, default_source="delta_norm"):
+        score_source = explicit_source or self.score_source or default_source
+        if score_source not in {"delta_norm", "intervention_norm"}:
+            raise ValueError(f"Unsupported score_source: {score_source}")
+        return score_source
+
+    def _get_raw_scores(self, features, explicit_source=None, default_source="delta_norm"):
+        score_source = self._resolve_score_source(
+            explicit_source=explicit_source,
+            default_source=default_source,
+        )
+        return features[score_source].float(), score_source
+
+    def _normalize_scores(self, raw_scores, mode=None):
         norm_mode = mode or self.score_normalizer or "none"
-        delta_norm = delta_norm.float()
+        raw_scores = raw_scores.float()
 
         if norm_mode == "none":
-            scores = delta_norm
+            scores = raw_scores
         elif norm_mode == "mean_ratio":
             if self.score_mean is None:
                 raise ValueError("mean_ratio normalization requires score_mean stats.")
             denom = self.score_mean.float().view(1, 1, -1).clamp_min(self.score_eps)
-            scores = delta_norm / denom
+            scores = raw_scores / denom
         elif norm_mode == "log_zscore":
             if self.score_log_mean is None or self.score_log_std is None:
                 raise ValueError("log_zscore normalization requires score_log_mean / score_log_std stats.")
-            log_delta = torch.log(delta_norm + self.score_eps)
+            log_scores = torch.log(raw_scores + self.score_eps)
             mean = self.score_log_mean.float().view(1, 1, -1)
             std = self.score_log_std.float().view(1, 1, -1).clamp_min(self.score_eps)
-            scores = (log_delta - mean) / std
+            scores = (log_scores - mean) / std
         else:
             raise ValueError(f"Unsupported score_normalizer: {norm_mode}")
 
@@ -294,37 +314,48 @@ class ComposableLoreftIntervention(
             scores = torch.clamp(scores, min=-self.score_clip, max=self.score_clip)
         return scores
 
+    def _get_effective_scores(self, raw_scores, mode=None):
+        norm_mode = mode or self.score_normalizer or "none"
+        if norm_mode == "none":
+            return raw_scores.float(), None
+        normalized_scores = self._normalize_scores(raw_scores, mode=norm_mode)
+        return normalized_scores, normalized_scores
+
     def _policy_single(self, features):
         if self.single_index is None:
             raise ValueError("single policy requires `single_index`.")
         alpha = torch.zeros_like(features["delta_norm"])
         alpha[..., int(self.single_index)] = 1.0
-        return alpha, alpha, None
+        return alpha, alpha, None, None
 
     def _policy_equal(self, features):
         alpha = torch.full_like(features["delta_norm"], 1.0 / self.num_specialists)
         scores = torch.ones_like(alpha)
-        return alpha, scores, None
+        return alpha, scores, None, None
 
     def _policy_residual_softmax(self, features):
         scores = features["delta_norm"] / max(self.temperature, 1e-6)
         alpha = torch.softmax(scores, dim=-1)
-        return alpha, features["delta_norm"], None
+        return alpha, features["delta_norm"], None, {"score_source": "delta_norm"}
 
     def _policy_residual_scaled_softmax(self, features):
-        normalized_scores = self._normalize_delta_scores(features["delta_norm"], mode="mean_ratio")
+        normalized_scores = self._normalize_scores(features["delta_norm"], mode="mean_ratio")
         alpha = torch.softmax(normalized_scores / max(self.temperature, 1e-6), dim=-1)
-        return alpha, features["delta_norm"], normalized_scores
+        return alpha, features["delta_norm"], normalized_scores, {"score_source": "delta_norm"}
 
     def _policy_residual_logz_softmax(self, features):
-        normalized_scores = self._normalize_delta_scores(features["delta_norm"], mode="log_zscore")
+        normalized_scores = self._normalize_scores(features["delta_norm"], mode="log_zscore")
         alpha = torch.softmax(normalized_scores / max(self.temperature, 1e-6), dim=-1)
-        return alpha, features["delta_norm"], normalized_scores
+        return alpha, features["delta_norm"], normalized_scores, {"score_source": "delta_norm"}
 
     def _policy_intervention_softmax(self, features):
-        scores = features["intervention_norm"] / max(self.temperature, 1e-6)
-        alpha = torch.softmax(scores, dim=-1)
-        return alpha, features["intervention_norm"], None
+        raw_scores, score_source = self._get_raw_scores(
+            features,
+            default_source="intervention_norm",
+        )
+        effective_scores, normalized_scores = self._get_effective_scores(raw_scores)
+        alpha = torch.softmax(effective_scores / max(self.temperature, 1e-6), dim=-1)
+        return alpha, raw_scores, normalized_scores, {"score_source": score_source}
 
     def _policy_topk_residual(self, features):
         scores = features["delta_norm"]
@@ -334,17 +365,27 @@ class ComposableLoreftIntervention(
         mask = torch.zeros_like(scores, dtype=torch.bool)
         mask.scatter_(dim=-1, index=indices, value=True)
         alpha = self._masked_softmax(scores / max(self.temperature, 1e-6), mask)
-        return alpha, scores, None
+        return alpha, scores, None, {
+            "score_source": "delta_norm",
+            "topk_mask": mask,
+        }
 
     def _policy_compat_filtered_topk(self, features):
-        scores = features["delta_norm"]
+        raw_scores, score_source = self._get_raw_scores(
+            features,
+            default_source="delta_norm",
+        )
+        effective_scores, normalized_scores = self._get_effective_scores(raw_scores)
         pairwise_cos = features["pairwise_cos"]
         topk = self.topk if self.topk is not None else 1
         topk = min(int(topk), self.num_specialists)
-        _, indices = torch.topk(scores, k=topk, dim=-1)
-        mask = torch.zeros_like(scores, dtype=torch.bool)
+        _, indices = torch.topk(effective_scores, k=topk, dim=-1)
+        mask = torch.zeros_like(raw_scores, dtype=torch.bool)
+        topk_mask = torch.zeros_like(raw_scores, dtype=torch.bool)
+        topk_mask.scatter_(dim=-1, index=indices, value=True)
+        rejected_conflict_mask = torch.zeros_like(raw_scores, dtype=torch.bool)
 
-        batch_size, num_positions, _ = scores.shape
+        batch_size, num_positions, _ = raw_scores.shape
         for b in range(batch_size):
             for s in range(num_positions):
                 chosen = []
@@ -356,12 +397,21 @@ class ComposableLoreftIntervention(
                             break
                     if keep:
                         chosen.append(idx)
+                    else:
+                        rejected_conflict_mask[b, s, idx] = True
                 if not chosen:
-                    chosen.append(int(indices[b, s, 0]))
+                    fallback = int(indices[b, s, 0])
+                    chosen.append(fallback)
+                    rejected_conflict_mask[b, s, fallback] = False
                 mask[b, s, chosen] = True
 
-        alpha = self._masked_softmax(scores / max(self.temperature, 1e-6), mask)
-        return alpha, scores, None
+        alpha = self._masked_softmax(effective_scores / max(self.temperature, 1e-6), mask)
+        return alpha, raw_scores, normalized_scores, {
+            "score_source": score_source,
+            "topk_mask": topk_mask,
+            "selected_mask": mask,
+            "rejected_conflict_mask": rejected_conflict_mask,
+        }
 
     def _policy_trainable(self, features):
         if self.policy_head is None:
@@ -378,7 +428,7 @@ class ComposableLoreftIntervention(
         ).to(self.source_weight.dtype)
         logits = self.policy_head(feature_tensor).squeeze(-1).float()
         alpha = torch.softmax(logits, dim=-1)
-        return alpha, logits, None
+        return alpha, logits, None, None
 
     def _compute_alpha(self, states, features):
         if self.use_trainable_policy and self.policy_type == "trainable":
@@ -429,20 +479,35 @@ class ComposableLoreftIntervention(
         latent_mix = torch.einsum("bst,bstk->bsk", alpha.float(), transported)
         return torch.einsum("bsk,kd->bsd", latent_mix, basis)
 
-    def _cache_debug_tensors(self, features, alpha, scores, normalized_score=None):
+    def _cache_debug_tensors(self, features, alpha, scores, normalized_score=None, policy_debug=None):
+        policy_debug = policy_debug or {}
         self.latest_alpha = alpha.detach().cpu()
         self.latest_scores = scores.detach().cpu()
         self.latest_normalized_score = normalized_score.detach().cpu() if normalized_score is not None else None
         self.latest_delta_norm = features["delta_norm"].detach().cpu()
         self.latest_intervention_norm = features["intervention_norm"].detach().cpu()
         self.latest_pairwise_cos = features["pairwise_cos"].detach().cpu()
-        selected_mask = alpha > 0
+        selected_mask = policy_debug.get("selected_mask")
+        if selected_mask is None:
+            selected_mask = alpha > 0
         self.latest_selected_mask = selected_mask.detach().cpu()
+        topk_mask = policy_debug.get("topk_mask")
+        self.latest_topk_mask = topk_mask.detach().cpu() if topk_mask is not None else None
+        rejected_conflict_mask = policy_debug.get("rejected_conflict_mask")
+        self.latest_rejected_conflict_mask = (
+            rejected_conflict_mask.detach().cpu() if rejected_conflict_mask is not None else None
+        )
+        if self.policy_type == "compat_filtered_topk":
+            self.latest_conflict_pair_mask = (features["pairwise_cos"] < self.compat_threshold).detach().cpu()
+        else:
+            self.latest_conflict_pair_mask = None
         pairwise = features["pairwise_cos"]
         alpha_pairs = alpha.unsqueeze(-1) * alpha.unsqueeze(-2)
         conflict = (alpha_pairs * torch.clamp(-pairwise, min=0.0)).sum(dim=(-1, -2))
         self.latest_conflict_score = conflict.detach().cpu()
         self.latest_compose_domain = self.compose_domain
+        self.latest_score_source = policy_debug.get("score_source") or self.score_source or "delta_norm"
+        self.latest_score_stats_source = self.score_stats_source
         if self.shared_basis is not None:
             self.latest_shared_basis_stats = {
                 "rank": int(self.shared_basis.shape[0]),
@@ -461,7 +526,7 @@ class ComposableLoreftIntervention(
     def forward(self, base, source=None, subspaces=None, **kwargs):
         states = self._compute_specialist_states(base)
         features = self._extract_policy_features(states)
-        alpha, scores, normalized_score = self._compute_alpha(states, features)
+        alpha, scores, normalized_score, policy_debug = self._compute_alpha(states, features)
 
         if self.compose_domain == "output":
             mixed = self._compose_output_space(states, alpha)
@@ -472,7 +537,13 @@ class ComposableLoreftIntervention(
         else:
             raise ValueError(f"Unsupported compose_domain: {self.compose_domain}")
 
-        self._cache_debug_tensors(features, alpha, scores, normalized_score=normalized_score)
+        self._cache_debug_tensors(
+            features,
+            alpha,
+            scores,
+            normalized_score=normalized_score,
+            policy_debug=policy_debug,
+        )
         output = base + mixed.to(base.dtype)
         return self.dropout(output.to(base.dtype))
 

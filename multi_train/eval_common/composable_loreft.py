@@ -79,6 +79,14 @@ def _compact_stats_tag(score_stats_path: str) -> str:
     return compact[:24]
 
 
+def _compact_score_source_tag(score_source: str) -> str:
+    mapping = {
+        "delta_norm": "dn",
+        "intervention_norm": "in",
+    }
+    return mapping.get(score_source, _sanitize_component(score_source))
+
+
 def build_composable_model_tag(
     base_model_path: str,
     specialist_dirs: List[str],
@@ -91,6 +99,7 @@ def build_composable_model_tag(
     shared_basis_type: Optional[str] = None,
     shared_basis_rank: Optional[int] = None,
     transport_type: Optional[str] = None,
+    score_source: Optional[str] = None,
     score_normalizer: Optional[str] = None,
     score_stats_path: Optional[str] = None,
     score_clip: Optional[float] = None,
@@ -102,6 +111,7 @@ def build_composable_model_tag(
     if len(specialist_names) > 4:
         joined += f"+{len(specialist_names) - 4}more"
     effective_score_normalizer = _infer_score_normalizer(composition_method, score_normalizer)
+    effective_score_source = _infer_score_source(composition_method, score_source)
 
     detail_parts = []
     if composition_method == "single" and single_index is not None:
@@ -117,6 +127,8 @@ def build_composable_model_tag(
         "compat_filtered_topk",
     } and composition_temperature is not None:
         detail_parts.append(f"temp{_format_float_tag(composition_temperature)}")
+    if composition_method in {"intervention_softmax", "compat_filtered_topk"}:
+        detail_parts.append(f"src_{_compact_score_source_tag(effective_score_source)}")
     if composition_method == "compat_filtered_topk" and compat_threshold is not None:
         detail_parts.append(f"ct{_format_float_tag(compat_threshold)}")
     if effective_score_normalizer not in {"none", "mean_ratio", "log_zscore"}:
@@ -274,7 +286,33 @@ def _infer_score_normalizer(
     return score_normalizer or "none"
 
 
-def load_residual_stats(score_stats_path: Optional[str]) -> Optional[Dict]:
+def _infer_score_source(
+    composition_method: str,
+    score_source: Optional[str],
+) -> str:
+    if composition_method in {
+        "residual_softmax",
+        "residual_scaled_softmax",
+        "residual_logz_softmax",
+        "topk_residual",
+    }:
+        if score_source in {None, "", "delta_norm"}:
+            return "delta_norm"
+        raise ValueError(
+            f"composition_method={composition_method} requires score_source=delta_norm, got {score_source}."
+        )
+    if composition_method in {"intervention_softmax", "compat_filtered_topk"}:
+        if score_source in {None, ""}:
+            if composition_method == "intervention_softmax":
+                return "intervention_norm"
+            return "delta_norm"
+        if score_source not in {"delta_norm", "intervention_norm"}:
+            raise ValueError(f"Unsupported score_source: {score_source}")
+        return score_source
+    return "delta_norm"
+
+
+def load_score_stats(score_stats_path: Optional[str]) -> Optional[Dict]:
     if not score_stats_path:
         return None
     with open(score_stats_path, "r", encoding="utf-8") as f:
@@ -327,8 +365,9 @@ def build_composable_reft_config(
     shared_basis_type: Optional[str],
     shared_basis_rank: Optional[int],
     transport_type: Optional[str],
+    score_source: Optional[str] = None,
     score_normalizer: Optional[str] = None,
-    residual_stats: Optional[Dict] = None,
+    score_stats: Optional[Dict] = None,
     score_eps: float = 1e-6,
     score_clip: Optional[float] = None,
     use_trainable_policy: bool = False,
@@ -341,6 +380,7 @@ def build_composable_reft_config(
     if compose_domain == "shared_latent" and transport_type is None:
         transport_type = "identity"
     normalized_score_mode = _infer_score_normalizer(composition_method, score_normalizer)
+    effective_score_source = _infer_score_source(composition_method, score_source)
 
     for layer in target_layers:
         layer_rotate = [state[layer]["rotate_weight"] for state in specialist_states]
@@ -360,6 +400,8 @@ def build_composable_reft_config(
             "shared_basis_type": shared_basis_type,
             "shared_basis_rank": basis_rank,
             "transport_type": transport_type,
+            "score_source": effective_score_source,
+            "score_stats_source": score_stats.get("score_source") if score_stats is not None else None,
             "score_normalizer": normalized_score_mode,
             "score_eps": score_eps,
             "score_clip": score_clip,
@@ -371,12 +413,12 @@ def build_composable_reft_config(
             "add_bias": False,
         }
         if normalized_score_mode != "none":
-            if residual_stats is None:
+            if score_stats is None:
                 raise ValueError(
                     f"composition_method={composition_method} requires score_stats_path / residual stats."
                 )
             intervention_kwargs["score_stats"] = _build_layer_score_stats(
-                residual_stats=residual_stats,
+                residual_stats=score_stats,
                 layer=layer,
                 specialist_labels=specialist_labels,
             )
@@ -417,6 +459,7 @@ def load_composed_reft_model(
     shared_basis_type: Optional[str],
     shared_basis_rank: Optional[int],
     transport_type: Optional[str],
+    score_source: Optional[str] = None,
     score_normalizer: Optional[str] = None,
     score_stats_path: Optional[str] = None,
     score_eps: float = 1e-6,
@@ -428,12 +471,19 @@ def load_composed_reft_model(
     specialist_labels = [normalize_specialist_label(path) for path in specialist_dirs]
     resolved_layers = _collect_target_layers(specialist_states, target_layers)
     _validate_layer_shapes(specialist_states, resolved_layers)
-    residual_stats = load_residual_stats(score_stats_path)
-    if residual_stats is not None:
-        stats_labels = residual_stats.get("specialist_labels", [])
+    effective_score_source = _infer_score_source(composition_method, score_source)
+    score_stats = load_score_stats(score_stats_path)
+    if score_stats is not None:
+        stats_labels = score_stats.get("specialist_labels", [])
         missing = [label for label in specialist_labels if label not in stats_labels]
         if missing:
-            raise ValueError(f"Residual stats file missing specialist labels: {missing}")
+            raise ValueError(f"Score stats file missing specialist labels: {missing}")
+        stats_score_source = score_stats.get("score_source")
+        if stats_score_source is not None and stats_score_source != effective_score_source:
+            raise ValueError(
+                "Score stats file source mismatch: "
+                f"expected {effective_score_source}, got {stats_score_source}."
+            )
     reft_config = build_composable_reft_config(
         model=model,
         specialist_states=specialist_states,
@@ -448,8 +498,9 @@ def load_composed_reft_model(
         shared_basis_type=shared_basis_type,
         shared_basis_rank=shared_basis_rank,
         transport_type=transport_type,
+        score_source=effective_score_source,
         score_normalizer=score_normalizer,
-        residual_stats=residual_stats,
+        score_stats=score_stats,
         score_eps=score_eps,
         score_clip=score_clip,
         use_trainable_policy=use_trainable_policy,

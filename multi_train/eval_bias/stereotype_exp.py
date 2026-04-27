@@ -189,6 +189,13 @@ def _init_debug_accumulator(model, specialist_labels):
             "delta_norm_sq_sum": None,
             "intervention_norm_sum": None,
             "intervention_norm_sq_sum": None,
+            "selected_mask_sum": None,
+            "topk_mask_sum": None,
+            "rejected_conflict_mask_sum": None,
+            "conflict_score_sum": None,
+            "conflict_score_sq_sum": None,
+            "score_source": None,
+            "score_stats_source": None,
             "count": 0,
         }
 
@@ -209,6 +216,12 @@ def _update_debug_accumulator(accumulator, model):
         normalized_score = getattr(intervention, "latest_normalized_score", None)
         delta_norm = getattr(intervention, "latest_delta_norm", None)
         intervention_norm = getattr(intervention, "latest_intervention_norm", None)
+        selected_mask = getattr(intervention, "latest_selected_mask", None)
+        topk_mask = getattr(intervention, "latest_topk_mask", None)
+        rejected_conflict_mask = getattr(intervention, "latest_rejected_conflict_mask", None)
+        conflict_score = getattr(intervention, "latest_conflict_score", None)
+        score_source = getattr(intervention, "latest_score_source", None)
+        score_stats_source = getattr(intervention, "latest_score_stats_source", None)
         if alpha is None or delta_norm is None or intervention_norm is None:
             continue
 
@@ -216,6 +229,12 @@ def _update_debug_accumulator(accumulator, model):
         normalized_score = normalized_score.float() if normalized_score is not None else None
         delta_norm = delta_norm.float()
         intervention_norm = intervention_norm.float()
+        selected_mask = selected_mask.float() if selected_mask is not None else None
+        topk_mask = topk_mask.float() if topk_mask is not None else None
+        rejected_conflict_mask = (
+            rejected_conflict_mask.float() if rejected_conflict_mask is not None else None
+        )
+        conflict_score = conflict_score.float() if conflict_score is not None else None
 
         layer_stats = accumulator["layers"][layer_name]
         alpha_sum = alpha.sum(dim=(0, 1))
@@ -226,6 +245,13 @@ def _update_debug_accumulator(accumulator, model):
         delta_sq_sum = (delta_norm ** 2).sum(dim=(0, 1))
         intv_sum = intervention_norm.sum(dim=(0, 1))
         intv_sq_sum = (intervention_norm ** 2).sum(dim=(0, 1))
+        selected_sum = selected_mask.sum(dim=(0, 1)) if selected_mask is not None else None
+        topk_sum = topk_mask.sum(dim=(0, 1)) if topk_mask is not None else None
+        rejected_sum = (
+            rejected_conflict_mask.sum(dim=(0, 1)) if rejected_conflict_mask is not None else None
+        )
+        conflict_sum = conflict_score.sum() if conflict_score is not None else None
+        conflict_sq_sum = ((conflict_score ** 2).sum()) if conflict_score is not None else None
         count = int(alpha.shape[0] * alpha.shape[1])
 
         if layer_stats["alpha_sum"] is None:
@@ -237,6 +263,11 @@ def _update_debug_accumulator(accumulator, model):
             layer_stats["delta_norm_sq_sum"] = delta_sq_sum
             layer_stats["intervention_norm_sum"] = intv_sum
             layer_stats["intervention_norm_sq_sum"] = intv_sq_sum
+            layer_stats["selected_mask_sum"] = selected_sum
+            layer_stats["topk_mask_sum"] = topk_sum
+            layer_stats["rejected_conflict_mask_sum"] = rejected_sum
+            layer_stats["conflict_score_sum"] = conflict_sum
+            layer_stats["conflict_score_sq_sum"] = conflict_sq_sum
         else:
             layer_stats["alpha_sum"] += alpha_sum
             layer_stats["alpha_sq_sum"] += alpha_sq_sum
@@ -251,6 +282,39 @@ def _update_debug_accumulator(accumulator, model):
             layer_stats["delta_norm_sq_sum"] += delta_sq_sum
             layer_stats["intervention_norm_sum"] += intv_sum
             layer_stats["intervention_norm_sq_sum"] += intv_sq_sum
+            if selected_sum is not None:
+                if layer_stats["selected_mask_sum"] is None:
+                    layer_stats["selected_mask_sum"] = selected_sum
+                else:
+                    layer_stats["selected_mask_sum"] += selected_sum
+            if topk_sum is not None:
+                if layer_stats["topk_mask_sum"] is None:
+                    layer_stats["topk_mask_sum"] = topk_sum
+                else:
+                    layer_stats["topk_mask_sum"] += topk_sum
+            if rejected_sum is not None:
+                if layer_stats["rejected_conflict_mask_sum"] is None:
+                    layer_stats["rejected_conflict_mask_sum"] = rejected_sum
+                else:
+                    layer_stats["rejected_conflict_mask_sum"] += rejected_sum
+            if conflict_sum is not None:
+                if layer_stats["conflict_score_sum"] is None:
+                    layer_stats["conflict_score_sum"] = conflict_sum
+                    layer_stats["conflict_score_sq_sum"] = conflict_sq_sum
+                else:
+                    layer_stats["conflict_score_sum"] += conflict_sum
+                    layer_stats["conflict_score_sq_sum"] += conflict_sq_sum
+
+        if score_source is not None:
+            if layer_stats["score_source"] is None:
+                layer_stats["score_source"] = score_source
+            elif layer_stats["score_source"] != score_source:
+                layer_stats["score_source"] = "mixed"
+        if score_stats_source is not None:
+            if layer_stats["score_stats_source"] is None:
+                layer_stats["score_stats_source"] = score_stats_source
+            elif layer_stats["score_stats_source"] != score_stats_source:
+                layer_stats["score_stats_source"] = "mixed"
 
         layer_stats["count"] += count
 
@@ -287,6 +351,19 @@ def _finalize_debug_accumulator(accumulator):
             normalized_score_mean = stats["normalized_score_sum"] / count
             normalized_score_var = (stats["normalized_score_sq_sum"] / count) - normalized_score_mean.pow(2)
             normalized_score_std = torch.sqrt(torch.clamp(normalized_score_var, min=0.0))
+        selected_mean = stats["selected_mask_sum"] / count if stats["selected_mask_sum"] is not None else None
+        topk_mean = stats["topk_mask_sum"] / count if stats["topk_mask_sum"] is not None else None
+        rejected_mean = (
+            stats["rejected_conflict_mask_sum"] / count
+            if stats["rejected_conflict_mask_sum"] is not None
+            else None
+        )
+        conflict_score_mean = None
+        conflict_score_std = None
+        if stats["conflict_score_sum"] is not None:
+            conflict_score_mean = stats["conflict_score_sum"] / count
+            conflict_score_var = (stats["conflict_score_sq_sum"] / count) - conflict_score_mean * conflict_score_mean
+            conflict_score_std = max(float(conflict_score_var), 0.0) ** 0.5
 
         per_specialist = []
         for idx in range(alpha_mean.shape[0]):
@@ -304,10 +381,20 @@ def _finalize_debug_accumulator(accumulator):
             if normalized_score_mean is not None:
                 entry["normalized_score_mean"] = float(normalized_score_mean[idx].item())
                 entry["normalized_score_std"] = float(normalized_score_std[idx].item())
+            if selected_mean is not None:
+                entry["selected_rate"] = float(selected_mean[idx].item())
+            if topk_mean is not None:
+                entry["topk_rate"] = float(topk_mean[idx].item())
+            if rejected_mean is not None:
+                entry["rejected_conflict_rate"] = float(rejected_mean[idx].item())
             per_specialist.append(entry)
 
         finalized["layers"][layer_name] = {
             "count": count,
+            "score_source": stats["score_source"],
+            "score_stats_source": stats["score_stats_source"],
+            "conflict_score_mean": None if conflict_score_mean is None else float(conflict_score_mean),
+            "conflict_score_std": conflict_score_std,
             "per_specialist": per_specialist,
         }
 
@@ -348,6 +435,7 @@ def parse_args():
     parser.add_argument("--shared_basis_type", choices=["orth_mean", "svd_union"], default=None)
     parser.add_argument("--shared_basis_rank", type=int, default=None)
     parser.add_argument("--transport_type", choices=["identity", "overlap"], default=None)
+    parser.add_argument("--score_source", choices=["delta_norm", "intervention_norm"], default=None)
     parser.add_argument("--score_normalizer", choices=["none", "mean_ratio", "log_zscore"], default="none")
     parser.add_argument("--score_stats_path", type=str, default=None)
     parser.add_argument("--score_eps", type=float, default=1e-6)
@@ -441,6 +529,7 @@ def load_model(args):
             shared_basis_type=args.shared_basis_type,
             shared_basis_rank=args.shared_basis_rank,
             transport_type=args.transport_type,
+            score_source=args.score_source,
             score_normalizer=args.score_normalizer,
             score_stats_path=args.score_stats_path,
             score_eps=args.score_eps,
@@ -495,6 +584,7 @@ def resolve_model_tag(args):
             shared_basis_type=args.shared_basis_type,
             shared_basis_rank=args.shared_basis_rank,
             transport_type=args.transport_type,
+            score_source=args.score_source,
             score_normalizer=args.score_normalizer,
             score_stats_path=args.score_stats_path,
             score_clip=args.score_clip,
@@ -519,6 +609,7 @@ def build_composable_summary(args):
         "shared_basis_type": args.shared_basis_type if args.reft_specialists else None,
         "shared_basis_rank": args.shared_basis_rank if args.reft_specialists else None,
         "transport_type": args.transport_type if args.reft_specialists else None,
+        "score_source": args.score_source if args.reft_specialists else None,
         "score_normalizer": args.score_normalizer if args.reft_specialists else None,
         "score_stats_path": args.score_stats_path if args.reft_specialists else None,
         "score_eps": float(args.score_eps) if args.reft_specialists else None,

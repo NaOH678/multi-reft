@@ -130,12 +130,17 @@ def score_toxicity_csv(
 
     missing_mask = df["toxicity"].isna()
     missing_count = int(missing_mask.sum())
+    print(
+        f"[analysis] results_csv={results_csv} rows={len(df)} missing_toxicity={missing_count} "
+        f"batch_size={batch_size} device={device}"
+    )
 
     if missing_count > 0:
         model = _load_detoxify_model(detoxify_model_name=detoxify_model_name, device=device)
 
         missing_indices = df[missing_mask].index.tolist()
-        for start in range(0, len(missing_indices), batch_size):
+        total_batches = (len(missing_indices) + batch_size - 1) // batch_size
+        for batch_idx, start in enumerate(range(0, len(missing_indices), batch_size), start=1):
             batch_indices = missing_indices[start : start + batch_size]
             texts = [str(df.at[idx, "output"]) for idx in batch_indices]
             predictions = model.predict(texts)
@@ -144,9 +149,12 @@ def score_toxicity_csv(
                 raise RuntimeError("Detoxify returned an unexpected toxicity score length")
             for idx, score in zip(batch_indices, toxicity_scores):
                 df.at[idx, "toxicity"] = float(score)
+            if batch_idx == 1 or batch_idx == total_batches or batch_idx % 50 == 0:
+                print(f"[analysis] scored batch {batch_idx}/{total_batches}")
 
     scored_csv_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(scored_csv_path, index=False)
+    print(f"[analysis] wrote scored csv to: {scored_csv_path}")
 
     if datasets is None:
         datasets = sorted(df["dataset"].dropna().astype(str).unique().tolist())

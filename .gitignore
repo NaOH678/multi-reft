@@ -19,7 +19,8 @@ multi_train/eval_truth/generation
 multi_train/eval_bias/data
 multi_train/eval_ethics/data
 multi_train/eval_safety/data
-multi_train/eval_common/__pycahce__
+multi_train/eval_truth/__pycache__
+multi_train/eval_common/__pycache__
 multi_train/eval_ethics/__pycache__
 multi_train/eval_toxicity/__pycache__
 multi_train/eval_bias/__pycache__
@@ -50,6 +51,7 @@ baseline/LoRA/wandb/latest-run
 trainer_output
 calibration
 logs
+models
 .DS_Store
 =10.1
 

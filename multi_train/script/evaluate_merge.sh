@@ -10,15 +10,15 @@ fi
 # reft weights multi_train/trainer_output/Llama3-8b-Nodireft_truthful/stereotype
 # sft baseline/LoRA/llama3-8b-sft/checkpoint-4060
 # lora adapter baseline/LoRA/llama3-8b-lora/checkpoint-1524
-
-MERGE_SUMMARY_PATH="${MERGE_SUMMARY_PATH:-llama3-8b-Loreft-truthful_4}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-multi_train/trainer_output/Llama3-8b-Loreft_truthful_4}"
-BASE_MODEL="${BASE_MODEL:-../weightsft/models/llama3-8b/snapshots/8cde5ca8380496c9a6cc7ef3a8b46a0372a1d920}"
+# /mnt/petrelfs/shichaojian/multi-reft/trainer_output/Llama3-8b-Loreft_moral
+MERGE_SUMMARY_PATH="${MERGE_SUMMARY_PATH:-llama3-8b-base-truthfulqa}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-}"
+BASE_MODEL="${BASE_MODEL:-models/llama3-8b/snapshots/8cde5ca8380496c9a6cc7ef3a8b46a0372a1d920}"
 MODEL_MODE="${MODEL_MODE:-auto}"  # auto | reft | lora | base
 REFT_WEIGHTS="${REFT_WEIGHTS:-}"
 LORA_WEIGHTS="${LORA_WEIGHTS:-}"
 DEVICE="${DEVICE:-cuda:0}"
-BATCH_SIZE="${BATCH_SIZE:-128}"
+BATCH_SIZE="${BATCH_SIZE:-256}"
 POSITIONS="${POSITIONS:-7}"
 GREEDY_DECODING="${GREEDY_DECODING:-True}"
 TARGET_LAYERS="${TARGET_LAYERS:--1}"
@@ -29,8 +29,8 @@ CLEAN_SINGLE_SUMMARIES="${CLEAN_SINGLE_SUMMARIES:-0}"  # 1/true/yes 时，合并
 # Examples:
 # ONLY_DATASETS_DEFAULT="boolq hellaswag"
 # ONLY_CHECKPOINTS_DEFAULT="checkpoint-4060 checkpoint-5612"
-ONLY_DATASETS_DEFAULT="${ONLY_DATASETS_DEFAULT:-ARC-Easy ARC-Challenge boolq piqa social_i_qa winogrande hellaswag openbookqa truthfulqa_mc}"
-ONLY_CHECKPOINTS_DEFAULT="${ONLY_CHECKPOINTS_DEFAULT:-checkpoint-3330 checkpoint-3996}"
+ONLY_DATASETS_DEFAULT="${ONLY_DATASETS_DEFAULT:-truthfulqa_mc bbq}"
+ONLY_CHECKPOINTS_DEFAULT="${ONLY_CHECKPOINTS_DEFAULT:-}"
 
 DATASETS_DEFAULT=("ARC-Easy" "ARC-Challenge" "boolq" "piqa" "social_i_qa" "winogrande" "hellaswag" "openbookqa" "truthfulqa_mc" "bbq")
 ONLY_DATASETS_VALUE="${ONLY_DATASETS:-${ONLY_DATASETS_DEFAULT}}"

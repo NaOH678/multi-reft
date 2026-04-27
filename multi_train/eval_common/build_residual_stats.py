@@ -49,6 +49,12 @@ def parse_args():
         help="JSON file or inline JSON mapping each specialist to its own prompt file list.",
     )
     parser.add_argument("--text_column", type=str, default=None)
+    parser.add_argument(
+        "--score_source",
+        type=str,
+        choices=["delta_norm", "intervention_norm"],
+        default="delta_norm",
+    )
     parser.add_argument("--output_json", type=str, required=True)
     return parser.parse_args()
 
@@ -214,11 +220,17 @@ def resolve_target_layers(
     return requested_layers
 
 
-def init_stats(target_layers: List[int], specialist_labels: List[str], calibration_mode: str) -> Dict:
+def init_stats(
+    target_layers: List[int],
+    specialist_labels: List[str],
+    calibration_mode: str,
+    score_source: str,
+) -> Dict:
     return {
         "version": 1,
         "normalizer_scope": "layer_specialist",
         "calibration_mode": calibration_mode,
+        "score_source": score_source,
         "specialist_labels": specialist_labels,
         "layers": {
             str(layer): {
@@ -253,6 +265,7 @@ def finalize_stats(raw_stats: Dict, prompt_sources: Dict[str, int]) -> Dict:
         "version": raw_stats["version"],
         "normalizer_scope": raw_stats["normalizer_scope"],
         "calibration_mode": raw_stats.get("calibration_mode", "shared"),
+        "score_source": raw_stats.get("score_source", "delta_norm"),
         "specialist_labels": raw_stats["specialist_labels"],
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "prompt_sources": prompt_sources,
@@ -340,7 +353,17 @@ def _process_prompt_batch(
                 learned = torch.einsum("bsd,rd->bsr", hidden_at_units, source_weight) + source_bias.view(1, 1, -1)
                 delta = learned - rotated
                 delta_norm = delta.norm(dim=-1)
-                update_stats_entry(stats["layers"][str(layer)][label], delta_norm, eps=1e-6)
+                intervention = torch.einsum("bsr,dr->bsd", delta, rotate_weight)
+                intervention_norm = intervention.norm(dim=-1)
+
+                if args.score_source == "delta_norm":
+                    values = delta_norm
+                elif args.score_source == "intervention_norm":
+                    values = intervention_norm
+                else:
+                    raise ValueError(f"Unsupported score_source: {args.score_source}")
+
+                update_stats_entry(stats["layers"][str(layer)][label], values, eps=1e-6)
 
 
 def main():
@@ -350,7 +373,12 @@ def main():
     specialist_states = [load_loreft_specialist_state(path) for path in args.reft_specialists]
     specialist_labels = [normalize_specialist_label(path) for path in args.reft_specialists]
     target_layers = resolve_target_layers(specialist_states, args.target_layers)
-    stats = init_stats(target_layers, specialist_labels, args.calibration_mode)
+    stats = init_stats(
+        target_layers,
+        specialist_labels,
+        args.calibration_mode,
+        args.score_source,
+    )
 
     tokenizer = AutoTokenizer.from_pretrained(args.base_model)
     tokenizer.padding_side = "left"
@@ -414,7 +442,7 @@ def main():
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as f:
         json.dump(finalize_stats(stats, prompt_sources=prompt_sources), f, indent=2)
-    print(f"Residual stats written to: {output_path}")
+    print(f"Score stats written to: {output_path}")
 
 
 if __name__ == "__main__":

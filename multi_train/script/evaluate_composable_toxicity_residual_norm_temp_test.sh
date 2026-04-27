@@ -7,16 +7,20 @@ cd "${ROOT_DIR}"
 LOG_DIR="${LOG_DIR:-multi_train/logs/composable_toxicity_residual_norm_temp_$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "${LOG_DIR}"
 
-BASE_MODEL="${BASE_MODEL:-../weightsft/models/llama3-8b/snapshots/8cde5ca8380496c9a6cc7ef3a8b46a0372a1d920}"
-SPEC1="${SPEC1:-/mnt/shared-storage-user/zhoujiawei/fusion/multi-reft/multi_train/trainer_output/Llama3-8b-Loreft_truthful_4/checkpoint-3330/intervenable_model}"
-SPEC2="${SPEC2:-/mnt/shared-storage-user/zhoujiawei/fusion/multi-reft/multi_train/trainer_output/Llama3-8b-Loreft_moral/checkpoint-330/intervenable_model}"
-SPEC3="${SPEC3:-/mnt/shared-storage-user/zhoujiawei/fusion/multi-reft/multi_train/trainer_output/Llama3-8b-Loreft_stereotype_1/checkpoint-160/intervenable_model}"
-SPEC4="${SPEC4:-/mnt/shared-storage-user/zhoujiawei/fusion/multi-reft/multi_train/trainer_output/Llama3-8b-Loreft_toxicity/checkpoint-235/intervenable_model}"
+BASE_MODEL="${BASE_MODEL:-models/llama3-8b/snapshots/8cde5ca8380496c9a6cc7ef3a8b46a0372a1d920}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+SPEC1="${SPEC1:-multi-reft/multi_train/trainer_output/Llama3-8b-Loreft_truthful_4/checkpoint-3330/intervenable_model}"
+SPEC2="${SPEC2:-multi-reft/multi_train/trainer_output/Llama3-8b-Loreft_moral/checkpoint-330/intervenable_model}"
+SPEC3="${SPEC3:-multi-reft/multi_train/trainer_output/Llama3-8b-Loreft_stereotype_1/checkpoint-160/intervenable_model}"
+SPEC4="${SPEC4:-multi_train/trainer_output/Llama3-8b-Loreft_toxicity/checkpoint-235/intervenable_model}"
 
 SHARED_STATS="${SHARED_STATS:-multi_train/calibration/train_input/stats/residual_stats_shared_train_input.json}"
 SPECIAL_STATS="${SPECIAL_STATS:-multi_train/calibration/train_input/stats/residual_stats_specialist_train_input.json}"
 
-BATCH_SIZE="${BATCH_SIZE:-256}"
+BATCH_SIZE="${BATCH_SIZE:-128}"
+RUN_ANALYSIS="${RUN_ANALYSIS:-1}"
+ANALYSIS_BATCH_SIZE="${ANALYSIS_BATCH_SIZE:-32}"
+DETOXIFY_MODEL="${DETOXIFY_MODEL:-original}"
 TEMPS="${TEMPS:-0.5 1 2 4 8 16 32 64}"
 DEVICES="${DEVICES:-cuda:0 cuda:1 cuda:2 cuda:3 cuda:4 cuda:5 cuda:6 cuda:7}"
 
@@ -30,18 +34,32 @@ run_eval() {
   local temp="$4"
   local log_file="$5"
 
-  python multi_train/eval_toxicity/toxicity_exp.py \
-    --base_model "${BASE_MODEL}" \
-    --batch_size "${BATCH_SIZE}" \
-    --reft_specialists "${SPEC1}" "${SPEC2}" "${SPEC3}" "${SPEC4}" \
-    --compose_domain output \
-    --composition_method "${method}" \
-    --composition_temperature "${temp}" \
-    --score_stats_path "${stats_path}" \
-    --target_layers -1 \
-    --positions 7 \
-    --device "${device}" \
-    > "${log_file}" 2>&1
+  {
+    echo "===== device=${device} method=${method} temp=${temp} ====="
+    echo "BASE_MODEL=${BASE_MODEL}"
+    echo "BATCH_SIZE=${BATCH_SIZE}"
+    echo "RUN_ANALYSIS=${RUN_ANALYSIS}"
+    echo "ANALYSIS_BATCH_SIZE=${ANALYSIS_BATCH_SIZE}"
+    echo "ANALYSIS_DEVICE=${device}"
+    echo "DETOXIFY_MODEL=${DETOXIFY_MODEL}"
+    echo "SCORE_STATS_PATH=${stats_path}"
+    echo
+    PYTHONUNBUFFERED=1 "${PYTHON_BIN}" multi_train/eval_toxicity/toxicity_exp.py \
+      --base_model "${BASE_MODEL}" \
+      --batch_size "${BATCH_SIZE}" \
+      --reft_specialists "${SPEC1}" "${SPEC2}" "${SPEC3}" "${SPEC4}" \
+      --compose_domain output \
+      --composition_method "${method}" \
+      --composition_temperature "${temp}" \
+      --score_stats_path "${stats_path}" \
+      --target_layers -1 \
+      --positions 7 \
+      --device "${device}" \
+      --run_analysis "${RUN_ANALYSIS}" \
+      --analysis_batch_size "${ANALYSIS_BATCH_SIZE}" \
+      --detoxify_model "${DETOXIFY_MODEL}" \
+      --analysis_device "${device}"
+  } > "${log_file}" 2>&1
 }
 
 job_idx=0
