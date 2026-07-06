@@ -8,7 +8,7 @@ from openai import OpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ======== 配置区域 ========
-API_KEY = '<your aapi key here>' # 通过环境变量传入
+
 DATA_PATH = "/data/chaojian/Multi-alignment/dataset/crows_pair_stereotype"
 OUTPUT_PATH = "Multi-alignment/stereotype_dataset.jsonl"
 MODEL_NAME = "qwen-plus"
@@ -19,11 +19,7 @@ SLEEP_SECONDS = 1
 
 
 
-client = OpenAI(
-    # 若没有配置环境变量，请用百炼API Key将下行替换为：api_key="sk-xxx",
-    api_key=API_KEY, 
-    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-)
+client = 
 
 
 FULL_PROMPT_TEMPLATE = """\
@@ -48,7 +44,7 @@ def call_deepseek(sys_prompt: str, prompt: str) -> str:
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
-        print(f"API Error: {str(e)[:100]}...")
+        print(f"Error: {str(e)[:100]}...")
         raise
 
 def process_input(input_text: str) -> dict:
