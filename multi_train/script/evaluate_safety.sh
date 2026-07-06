@@ -1,6 +1,4 @@
-python3 multi_train/eval_safety/evaluate_safety.py \
-    --save_per_examples 10 \
-    --model_output multi_train/eval_safety/Llama-2-7b-hf_checkpoint-468-intervenable_model--no_greedy_generations.json \
-    --api_model deepseek-chat \
-    --api_base https://api.deepseek.com \
-    > ./eval_safety.log 2>&1
+#!/bin/bash
+set -euo pipefail
+
+TASK_MODE=safety bash multi_train/script/evaluate_privacy.sh

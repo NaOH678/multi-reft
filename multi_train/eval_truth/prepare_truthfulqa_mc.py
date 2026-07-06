@@ -1,8 +1,8 @@
 import argparse
+import hashlib
 import json
+import random
 from pathlib import Path
-
-from datasets import load_dataset
 
 
 def build_instruction(question: str, choices: list[str]) -> str:
@@ -17,13 +17,38 @@ def build_instruction(question: str, choices: list[str]) -> str:
     )
 
 
-def convert_truthfulqa_mc(split: str, target: str) -> tuple[list[dict], int]:
+def reorder_choices(
+    question: str,
+    choices: list[str],
+    correct_idx: int,
+    sample_idx: int,
+    seed: int,
+) -> tuple[list[str], int]:
+    correct_choice = choices[correct_idx]
+    incorrect_choices = [
+        choice for idx, choice in enumerate(choices) if idx != correct_idx
+    ]
+
+    seed_material = f"{seed}\t{sample_idx}\t{question}".encode("utf-8")
+    rng_seed = int.from_bytes(hashlib.sha256(seed_material).digest()[:8], "big")
+    rng = random.Random(rng_seed)
+    rng.shuffle(incorrect_choices)
+
+    new_correct_idx = (sample_idx + seed) % len(choices)
+    reordered_choices = incorrect_choices[:]
+    reordered_choices.insert(new_correct_idx, correct_choice)
+    return reordered_choices, new_correct_idx
+
+
+def convert_truthfulqa_mc(split: str, target: str, seed: int) -> tuple[list[dict], int]:
+    from datasets import load_dataset
+
     dataset = load_dataset("truthfulqa/truthful_qa", "multiple_choice", split=split)
     target_key = f"{target}_targets"
     rows = []
     skipped = 0
 
-    for item in dataset:
+    for sample_idx, item in enumerate(dataset):
         question = (item.get("question") or "").strip()
         targets = item.get(target_key)
         if not question or not isinstance(targets, dict):
@@ -41,13 +66,19 @@ def convert_truthfulqa_mc(split: str, target: str) -> tuple[list[dict], int]:
             skipped += 1
             continue
 
-        correct = correct_ids[0]
+        reordered_choices, reordered_correct_idx = reorder_choices(
+            question=question,
+            choices=choices,
+            correct_idx=correct_ids[0],
+            sample_idx=sample_idx,
+            seed=seed,
+        )
         rows.append(
             {
-                "instruction": build_instruction(question, choices),
+                "instruction": build_instruction(question, reordered_choices),
                 "input": "",
                 "output": "",
-                "answer": f"answer{correct + 1}",
+                "answer": f"answer{reordered_correct_idx + 1}",
             }
         )
 
@@ -59,6 +90,7 @@ def parse_args():
     parser.add_argument("--split", default="validation")
     parser.add_argument("--target", choices=["mc1", "mc2"], default="mc1")
     parser.add_argument("--max_samples", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_path", default=None)
     return parser.parse_args()
 
@@ -71,7 +103,11 @@ def main():
     else:
         output_path = repo_root / "dataset" / "truthfulqa_mc" / "test.json"
 
-    rows, skipped = convert_truthfulqa_mc(split=args.split, target=args.target)
+    rows, skipped = convert_truthfulqa_mc(
+        split=args.split,
+        target=args.target,
+        seed=args.seed,
+    )
     if args.max_samples > 0:
         rows = rows[: args.max_samples]
 

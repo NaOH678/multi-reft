@@ -1,0 +1,18 @@
+{
+  "truthfulqa": {
+    "path": "dataset/alignment_truthful_format",
+    "split": "train"
+  },
+  "ethics": {
+    "path": "dataset/alignment_moral_cls",
+    "split": "train"
+  },
+  "bbq": {
+    "path": "dataset/alignment_stereotype_format",
+    "split": "train"
+  },
+  "toxicity": {
+    "path": "dataset/alignment_toxic_format",
+    "split": "train"
+  }
+}

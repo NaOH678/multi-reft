@@ -1,0 +1,6 @@
+{
+  "toxicity": 0.35,
+  "ethics": 0.25,
+  "truthfulqa": 0.20,
+  "bbq": 0.20
+}

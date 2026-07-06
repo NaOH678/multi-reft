@@ -5,7 +5,7 @@ from transformers import TrainingArguments as HFTrainingArguments
 @dataclass
 class TrainingArguments(HFTrainingArguments):
     model_name_or_path: str = "yahma/llama-7b-hf"
-    model_max_length: int = 768
+    model_max_length: int = 512
     output_dir: str = "./lora_output"
     num_train_epochs: int = 3
     learning_rate: float = 5e-5

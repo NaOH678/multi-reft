@@ -5,14 +5,18 @@ if [[ -z "${BASH_VERSION:-}" ]]; then
   echo "Please run this script with bash, not sh/zsh." >&2
   exit 1
 fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+cd "${REPO_ROOT}"
 # basemodels ../weightsft/models/llama3-8b/snapshots/8cde5ca8380496c9a6cc7ef3a8b46a0372a1d920
 # reft weights multi_train/trainer_output/Llama3-8b-Nodireft_truthful/stereotype
 # sft baseline/LoRA/llama3-8b-sft/checkpoint-4060
 # lora adapter baseline/LoRA/llama3-8b-lora/checkpoint-1524
 
-MERGE_SUMMARY_PATH="${MERGE_SUMMARY_PATH:-llama3-8b-loreft-toxicity}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-multi_train/trainer_output/Llama3-8b-Loreft_toxicity}"
-BASE_MODEL="${BASE_MODEL:-../weightsft/models/llama3-8b/snapshots/8cde5ca8380496c9a6cc7ef3a8b46a0372a1d920}"
+MERGE_SUMMARY_PATH="${MERGE_SUMMARY_PATH:-qwen3-4b-loreft-toxicity}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-multi_train/trainer_output/qwen3-4b_Loreft_toxicity_lr1p2e-3_bs16_ga2_ep6}"
+BASE_MODEL="${BASE_MODEL:-models/qwen3-4b}"
 MODEL_MODE="${MODEL_MODE:-auto}"  # auto | reft | lora | base
 REFT_WEIGHTS="${REFT_WEIGHTS:-}"
 LORA_WEIGHTS="${LORA_WEIGHTS:-}"
@@ -20,6 +24,9 @@ ONLY_CHECKPOINTS_DEFAULT="${ONLY_CHECKPOINTS_DEFAULT:-}"
 ONLY_CHECKPOINTS_VALUE="${ONLY_CHECKPOINTS:-${ONLY_CHECKPOINTS_DEFAULT}}"
 
 DEVICE="${DEVICE:-cuda:0}"
+GPU_IDS_VALUE="${GPU_IDS:-}"
+MAX_PARALLEL="${MAX_PARALLEL:-}"
+STAGGER_SECONDS="${STAGGER_SECONDS:-0}"
 BATCH_SIZE="${BATCH_SIZE:-256}"
 TARGET_LAYERS="${TARGET_LAYERS:--1}"
 SUBSPACE_RANK="${SUBSPACE_RANK:-8}"
@@ -41,18 +48,33 @@ TEMPERATURE="${TEMPERATURE:-0.7}"
 RUN_ANALYSIS="${RUN_ANALYSIS:-1}"
 ANALYSIS_BATCH_SIZE="${ANALYSIS_BATCH_SIZE:-32}"
 DETOXIFY_MODEL="${DETOXIFY_MODEL:-original}"
-ANALYSIS_DEVICE="${ANALYSIS_DEVICE:-cuda:0}"
+ANALYSIS_DEVICE="${ANALYSIS_DEVICE:-}"
 
 
 
-SUMMARY_DIR="${SUMMARY_DIR:-multi_train/eval_toxicity/data/summaries}"
-mkdir -p "${SUMMARY_DIR}"
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
+SUMMARY_DIR="${SUMMARY_DIR:-multi_train/eval_toxicity/data/summaries}"
+LOG_DIR="${LOG_DIR:-multi_train/logs/evaluate_toxicity_${RUN_TS}}"
+mkdir -p "${SUMMARY_DIR}"
+mkdir -p "${LOG_DIR}"
 
 
 read -r -a TARGET_LAYER_ARR <<< "${TARGET_LAYERS}"
 read -r -a DATASETS_ARR <<< "${DATASETS_VALUE}"
 read -r -a PROMPTS_ARR <<< "${PROMPTS_VALUE}"
+read -r -a GPU_IDS_ARR <<< "${GPU_IDS_VALUE}"
+
+if [[ -n "${GPU_IDS_VALUE}" ]]; then
+  if [[ "${#GPU_IDS_ARR[@]}" -eq 0 ]]; then
+    echo "GPU_IDS was provided but no GPU ids were parsed." >&2
+    exit 1
+  fi
+  if [[ -z "${MAX_PARALLEL}" ]]; then
+    MAX_PARALLEL="${#GPU_IDS_ARR[@]}"
+  fi
+else
+  MAX_PARALLEL="${MAX_PARALLEL:-1}"
+fi
 
 sanitize_name() {
   local value="$1"
@@ -61,6 +83,30 @@ sanitize_name() {
   value="${value//:/_}"
   echo "${value}"
 }
+
+resolve_base_model_path() {
+  local candidate="$1"
+  local refs_main
+  local snapshot_id
+
+  if [[ -d "${candidate}" && -f "${candidate}/config.json" ]]; then
+    echo "${candidate}"
+    return 0
+  fi
+
+  refs_main="${candidate%/}/refs/main"
+  if [[ -f "${refs_main}" ]]; then
+    snapshot_id="$(tr -d '[:space:]' < "${refs_main}")"
+    if [[ -n "${snapshot_id}" && -d "${candidate%/}/snapshots/${snapshot_id}" ]]; then
+      echo "${candidate%/}/snapshots/${snapshot_id}"
+      return 0
+    fi
+  fi
+
+  echo "${candidate}"
+}
+
+BASE_MODEL="$(resolve_base_model_path "${BASE_MODEL}")"
 
 compute_model_tag() {
   local base_model="$1"
@@ -360,176 +406,162 @@ MERGE_SUMMARY_PATH="$(build_merge_summary_path_with_prefix "${SUMMARY_DIR}" "${M
 
 SUCCESS_SUMMARIES=()
 FAILED_RUNS=()
+PIDS=()
+TARGET_NAMES_RUN=()
+SUMMARY_PATHS_RUN=()
+STATUS_FILES_RUN=()
+LOG_FILES_RUN=()
 
-for idx in "${!TARGET_NAMES[@]}"; do
-  target_name="${TARGET_NAMES[$idx]}"
-  run_base_model="${TARGET_BASE_MODELS[$idx]}"
-  run_reft_weights="${TARGET_REFT_WEIGHTS[$idx]}"
-  run_lora_weights="${TARGET_LORA_WEIGHTS[$idx]}"
+run_target() {
+  local idx="$1"
+  local gpu_slot="$2"
+  local target_name="${TARGET_NAMES[$idx]}"
+  local run_base_model="${TARGET_BASE_MODELS[$idx]}"
+  local run_reft_weights="${TARGET_REFT_WEIGHTS[$idx]}"
+  local run_lora_weights="${TARGET_LORA_WEIGHTS[$idx]}"
+  local checkpoint_label
   checkpoint_label="$(compute_checkpoint_label "${run_base_model}" "${run_reft_weights}" "${run_lora_weights}")"
+  local run_summary_file
   run_summary_file="$(build_single_summary_path_with_prefix "${SUMMARY_DIR}" "${MERGE_SUMMARY_PREFIX}" "toxicity" "${RUN_TS}" "${checkpoint_label}")"
+  local run_results_csv
   run_results_csv="$(build_results_csv_path_with_prefix "multi_train/eval_toxicity/data/generations" "${MERGE_SUMMARY_PREFIX}" "toxicity" "${checkpoint_label}")"
+  local run_log_file="${LOG_DIR}/$(sanitize_name "${target_name}").log"
+  local run_status_file="${LOG_DIR}/$(sanitize_name "${target_name}").status"
+  local run_device="${DEVICE}"
+  local run_analysis_device="${ANALYSIS_DEVICE}"
 
-  echo "Evaluating target: ${target_name}, datasets=${DATASETS_VALUE}, prompts=${PROMPTS_VALUE}"
-
-  cmd=(
-    python3 multi_train/eval_toxicity/toxicity_exp.py
-    --base_model "${run_base_model}"
-    --device "${DEVICE}"
-    --batch_size "${BATCH_SIZE}"
-    --datasets
-    "${DATASETS_ARR[@]}"
-    --prompts
-    "${PROMPTS_ARR[@]}"
-    --target_layers
-    "${TARGET_LAYER_ARR[@]}"
-    --subspace_rank "${SUBSPACE_RANK}"
-    --positions "${POSITIONS}"
-    --greedy_decoding "${GREEDY_DECODING}"
-    --dataset_root "${DATASET_ROOT}"
-    --n_generations "${N_GENERATIONS}"
-    --max_tokens "${MAX_TOKENS}"
-    --temperature "${TEMPERATURE}"
-    --run_analysis "${RUN_ANALYSIS}"
-    --analysis_batch_size "${ANALYSIS_BATCH_SIZE}"
-    --detoxify_model "${DETOXIFY_MODEL}"
-    --summary_json "${run_summary_file}"
-    --results_csv "${run_results_csv}"
-  )
-
-  if [[ -n "${MAX_SAMPLES}" ]]; then
-    cmd+=(--max_samples "${MAX_SAMPLES}")
-  fi
-  if [[ -n "${ANALYSIS_DEVICE}" ]]; then
-    cmd+=(--analysis_device "${ANALYSIS_DEVICE}")
-  fi
-  if [[ -n "${run_reft_weights}" ]]; then
-    cmd+=(--reft_weights "${run_reft_weights}")
-  fi
-  if [[ -n "${run_lora_weights}" ]]; then
-    cmd+=(--lora_weights "${run_lora_weights}")
+  if [[ -n "${GPU_IDS_VALUE}" ]]; then
+    run_device="cuda:${GPU_IDS_ARR[$gpu_slot]}"
+    if [[ -z "${run_analysis_device}" ]]; then
+      run_analysis_device="${run_device}"
+    fi
+  elif [[ -z "${run_analysis_device}" ]]; then
+    run_analysis_device="${run_device}"
   fi
 
-  set +e
-  CUDA_LAUNCH_BLOCKING=1 "${cmd[@]}"
-  status=$?
-  set -e
+  echo "Evaluating target: ${target_name}, device=${run_device}, datasets=${DATASETS_VALUE}, prompts=${PROMPTS_VALUE}, log=${run_log_file}"
 
-  if [[ ${status} -eq 0 ]]; then
-    if [[ "${RUN_ANALYSIS}" == "0" ]]; then
-      if [[ -f "${run_summary_file}" ]]; then
-        SUCCESS_SUMMARIES+=("${run_summary_file}")
-      fi
-    elif [[ -f "${run_summary_file}" ]]; then
-      SUCCESS_SUMMARIES+=("${run_summary_file}")
+  (
+    cmd=(
+      python3 multi_train/eval_toxicity/toxicity_exp.py
+      --base_model "${run_base_model}"
+      --device "${run_device}"
+      --batch_size "${BATCH_SIZE}"
+      --datasets
+      "${DATASETS_ARR[@]}"
+      --prompts
+      "${PROMPTS_ARR[@]}"
+      --target_layers
+      "${TARGET_LAYER_ARR[@]}"
+      --subspace_rank "${SUBSPACE_RANK}"
+      --positions "${POSITIONS}"
+      --greedy_decoding "${GREEDY_DECODING}"
+      --dataset_root "${DATASET_ROOT}"
+      --n_generations "${N_GENERATIONS}"
+      --max_tokens "${MAX_TOKENS}"
+      --temperature "${TEMPERATURE}"
+      --run_analysis "${RUN_ANALYSIS}"
+      --analysis_batch_size "${ANALYSIS_BATCH_SIZE}"
+      --detoxify_model "${DETOXIFY_MODEL}"
+      --summary_json "${run_summary_file}"
+      --results_csv "${run_results_csv}"
+    )
+
+    if [[ -n "${MAX_SAMPLES}" ]]; then
+      cmd+=(--max_samples "${MAX_SAMPLES}")
+    fi
+    if [[ -n "${run_analysis_device}" ]]; then
+      cmd+=(--analysis_device "${run_analysis_device}")
+    fi
+    if [[ -n "${run_reft_weights}" ]]; then
+      cmd+=(--reft_weights "${run_reft_weights}")
+    fi
+    if [[ -n "${run_lora_weights}" ]]; then
+      cmd+=(--lora_weights "${run_lora_weights}")
+    fi
+
+    echo "TARGET=${target_name}"
+    echo "DEVICE=${run_device}"
+    echo "ANALYSIS_DEVICE=${run_analysis_device}"
+    echo "SUMMARY=${run_summary_file}"
+    echo "RESULTS=${run_results_csv}"
+    echo
+    set +e
+    CUDA_LAUNCH_BLOCKING=1 "${cmd[@]}"
+    status=$?
+    set -e
+    printf '%s\n' "${status}" > "${run_status_file}"
+    exit "${status}"
+  ) >"${run_log_file}" 2>&1 &
+
+  PIDS+=("$!")
+  TARGET_NAMES_RUN+=("${target_name}")
+  SUMMARY_PATHS_RUN+=("${run_summary_file}")
+  STATUS_FILES_RUN+=("${run_status_file}")
+  LOG_FILES_RUN+=("${run_log_file}")
+}
+
+cleanup_children() {
+  for pid in "${PIDS[@]-}"; do
+    kill "${pid}" 2>/dev/null || true
+  done
+}
+
+trap cleanup_children INT TERM
+
+if [[ -n "${GPU_IDS_VALUE}" ]]; then
+  active_jobs=0
+  for idx in "${!TARGET_NAMES[@]}"; do
+    gpu_slot=$((idx % ${#GPU_IDS_ARR[@]}))
+    run_target "${idx}" "${gpu_slot}"
+    active_jobs=$((active_jobs + 1))
+    if [[ "${STAGGER_SECONDS}" -gt 0 ]]; then
+      sleep "${STAGGER_SECONDS}"
+    fi
+    if [[ "${active_jobs}" -ge "${MAX_PARALLEL}" ]]; then
+      wait
+      active_jobs=0
+    fi
+  done
+  if [[ "${active_jobs}" -gt 0 ]]; then
+    wait
+  fi
+else
+  for idx in "${!TARGET_NAMES[@]}"; do
+    run_target "${idx}" 0
+    wait "${PIDS[$idx]}"
+  done
+fi
+
+status=0
+for idx in "${!TARGET_NAMES_RUN[@]}"; do
+  target_status=1
+  if [[ -f "${STATUS_FILES_RUN[$idx]}" ]]; then
+    target_status="$(tr -d '[:space:]' < "${STATUS_FILES_RUN[$idx]}")"
+  fi
+
+  if [[ "${target_status}" == "0" ]]; then
+    if [[ -f "${SUMMARY_PATHS_RUN[$idx]}" ]]; then
+      SUCCESS_SUMMARIES+=("${SUMMARY_PATHS_RUN[$idx]}")
     else
-      FAILED_RUNS+=("$(sanitize_name "${target_name}")")
-      echo "FAILED: target=${target_name} (summary missing)" >&2
+      FAILED_RUNS+=("$(sanitize_name "${TARGET_NAMES_RUN[$idx]}")")
+      echo "FAILED: target=${TARGET_NAMES_RUN[$idx]} (summary missing, see ${LOG_FILES_RUN[$idx]})" >&2
+      status=1
     fi
   else
-    FAILED_RUNS+=("$(sanitize_name "${target_name}")")
-    echo "FAILED: target=${target_name}" >&2
+    FAILED_RUNS+=("$(sanitize_name "${TARGET_NAMES_RUN[$idx]}")")
+    echo "FAILED: target=${TARGET_NAMES_RUN[$idx]} (see ${LOG_FILES_RUN[$idx]})" >&2
+    status=1
   fi
 done
 
-python3 - "${MERGE_SUMMARY_PATH}" "${RUN_TS}" "${DATASETS_VALUE}" "${PROMPTS_VALUE}" "${FAILED_RUNS[*]-}" "${SUCCESS_SUMMARIES[@]-}" <<'PY'
-import json
-import sys
-from datetime import datetime, timezone
-from pathlib import Path
-
-merge_summary_path = Path(sys.argv[1])
-run_ts = sys.argv[2]
-datasets = [x for x in sys.argv[3].split() if x]
-prompts = [x for x in sys.argv[4].split() if x]
-failed_runs = sys.argv[5].split() if len(sys.argv) >= 6 and sys.argv[5].strip() else []
-summary_files = sys.argv[6:] if len(sys.argv) > 6 else []
-
-expected_tasks = [f"{d}|{p}" for d in datasets for p in prompts]
-
-
-def run_key(run):
-    model_tag = str(run.get("model_tag") or "").strip()
-    if model_tag:
-        return model_tag
-    return str(run.get("results_csv") or "unknown_target")
-
-
-runs = []
-for summary_file in summary_files:
-    p = Path(summary_file)
-    if not p.exists():
-        continue
-    try:
-        with open(p, "r") as f:
-            run = json.load(f)
-        run["summary_file"] = str(p)
-        run["run_key"] = run_key(run)
-        runs.append(run)
-    except Exception:
-        continue
-
-score_buckets = {}
-for run in runs:
-    key = run.get("run_key", "unknown_target")
-    score_buckets[key] = run
-
-checkpoint_scores = []
-for key, run in score_buckets.items():
-    task_metrics = run.get("task_metrics", {})
-    per_task = {}
-    values = []
-
-    for task_key in expected_tasks:
-        metric = task_metrics.get(task_key)
-        if metric is None:
-            continue
-        mean_toxicity = float(metric.get("mean_toxicity", 0.0))
-        per_task[task_key] = {
-            "num_samples": int(metric.get("num_samples", 0)),
-            "mean_toxicity": mean_toxicity,
-        }
-        values.append(mean_toxicity)
-
-    mean_toxicity_mean = sum(values) / len(values) if values else 1.0
-    missing_tasks = [task for task in expected_tasks if task not in per_task]
-
-    checkpoint_scores.append(
-        {
-            "checkpoint": key,
-            "mean_toxicity_mean": mean_toxicity_mean,
-            "per_task": per_task,
-            "missing_tasks": missing_tasks,
-        }
-    )
-
-checkpoint_scores.sort(key=lambda x: x["mean_toxicity_mean"])
-ranking = [
-    {
-        "rank": i + 1,
-        "checkpoint": item["checkpoint"],
-        "mean_toxicity_mean": item["mean_toxicity_mean"],
-    }
-    for i, item in enumerate(checkpoint_scores)
-]
-
-summary = {
-    "generated_at": datetime.now(timezone.utc).isoformat(),
-    "run_id": run_ts,
-    "datasets": datasets,
-    "prompts": prompts,
-    "runs": runs,
-    "checkpoint_scores": checkpoint_scores,
-    "ranking": ranking,
-    "failed_runs": failed_runs,
-}
-
-merge_summary_path.parent.mkdir(parents=True, exist_ok=True)
-with open(merge_summary_path, "w") as f:
-    json.dump(summary, f, indent=2)
-
-print(str(merge_summary_path))
-PY
+python3 multi_train/eval_toxicity/build_merge_summary.py \
+  --merge_summary_path "${MERGE_SUMMARY_PATH}" \
+  --run_ts "${RUN_TS}" \
+  --datasets "${DATASETS_ARR[@]}" \
+  --prompts "${PROMPTS_ARR[@]}" \
+  --failed_runs "${FAILED_RUNS[@]-}" \
+  --summary_files "${SUCCESS_SUMMARIES[@]-}"
 
 echo "Merge summary saved to: ${MERGE_SUMMARY_PATH}"
 if [[ ${#FAILED_RUNS[@]} -gt 0 ]]; then

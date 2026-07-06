@@ -32,6 +32,7 @@ from multi_train.eval_common.composable_loreft import (
     load_composed_reft_model,
     normalize_specialist_label,
 )
+from baseline.CAA_0.steering import apply_caa_steering, build_caa_model_tag
 
 
 USER_PROMPT_TEMPLATES = {
@@ -440,6 +441,7 @@ def parse_args():
     parser.add_argument("--score_stats_path", type=str, default=None)
     parser.add_argument("--score_eps", type=float, default=1e-6)
     parser.add_argument("--score_clip", type=float, default=None)
+    parser.add_argument("--truthful_score_penalty", type=float, default=0.0)
 
     parser.add_argument("--n_generations", type=int, default=4)
     parser.add_argument("--max_tokens", type=int, default=70)
@@ -450,6 +452,13 @@ def parse_args():
     parser.add_argument("--run_statistics", type=int, default=1)
     parser.add_argument("--summary_json", type=str, default=None)
     parser.add_argument("--results_prefix", type=str, default=None)
+    parser.add_argument("--caa_vector_dir", type=str, default=None)
+    parser.add_argument("--caa_vector_dirs", type=str, nargs="+", default=None)
+    parser.add_argument("--caa_layers", type=int, nargs="+", default=None)
+    parser.add_argument("--caa_alpha", type=float, default=1.0)
+    parser.add_argument("--caa_token_strategy", choices=["last", "all"], default="last")
+    parser.add_argument("--caa_composition", choices=["single", "sum", "mean", "norm_mean", "weighted_sum"], default="single")
+    parser.add_argument("--caa_weights", type=float, nargs="+", default=None)
 
     return parser.parse_args()
 
@@ -488,6 +497,10 @@ def load_model(args):
         print(f"load reft weight: {args.reft_weights}")
     elif args.lora_weights:
         print(f"load lora weight: {args.lora_weights}")
+    if args.caa_vector_dir:
+        print(f"load caa vectors from: {args.caa_vector_dir}")
+    if args.caa_vector_dirs:
+        print(f"load caa vectors from: {args.caa_vector_dirs}")
 
     tokenizer = AutoTokenizer.from_pretrained(base_model)
     tokenizer.padding_side = "left"
@@ -514,6 +527,9 @@ def load_model(args):
         model.generation_config.bos_token_id = tokenizer.bos_token_id
         model.generation_config.eos_token_id = tokenizer.eos_token_id
 
+    if (args.caa_vector_dir or args.caa_vector_dirs) and (args.reft_specialists or args.reft_weights or args.lora_weights):
+        raise ValueError("CAA steering cannot be combined with ReFT or LoRA in stereotype_exp.py.")
+
     
     if args.reft_specialists:
         model = load_composed_reft_model(
@@ -534,6 +550,7 @@ def load_model(args):
             score_stats_path=args.score_stats_path,
             score_eps=args.score_eps,
             score_clip=args.score_clip,
+            truthful_score_penalty=args.truthful_score_penalty,
         )
     elif args.reft_weights:
         if args.target_layers == [-1]:
@@ -566,6 +583,18 @@ def load_model(args):
             device_map={"": args.device},
             torch_dtype=torch.bfloat16,
         )
+    elif args.caa_vector_dir or args.caa_vector_dirs:
+        caa_config = apply_caa_steering(
+            model=model,
+            vector_dir=args.caa_vector_dir,
+            vector_dirs=args.caa_vector_dirs,
+            layers=args.caa_layers,
+            alpha=args.caa_alpha,
+            token_strategy=args.caa_token_strategy,
+            composition=args.caa_composition,
+            weights=args.caa_weights,
+        )
+        print(f"apply caa steering: {caa_config}")
 
     return tokenizer, model
 
@@ -588,6 +617,18 @@ def resolve_model_tag(args):
             score_normalizer=args.score_normalizer,
             score_stats_path=args.score_stats_path,
             score_clip=args.score_clip,
+            truthful_score_penalty=args.truthful_score_penalty,
+        )
+    if args.caa_vector_dir or args.caa_vector_dirs:
+        return build_caa_model_tag(
+            base_model_path=args.base_model,
+            vector_dir=args.caa_vector_dir,
+            vector_dirs=args.caa_vector_dirs,
+            layers=args.caa_layers,
+            alpha=args.caa_alpha,
+            token_strategy=args.caa_token_strategy,
+            composition=args.caa_composition,
+            weights=args.caa_weights,
         )
 
     return build_model_tag(
@@ -614,6 +655,7 @@ def build_composable_summary(args):
         "score_stats_path": args.score_stats_path if args.reft_specialists else None,
         "score_eps": float(args.score_eps) if args.reft_specialists else None,
         "score_clip": args.score_clip if args.reft_specialists else None,
+        "truthful_score_penalty": float(args.truthful_score_penalty) if args.reft_specialists else None,
     }
 
 
@@ -918,6 +960,8 @@ def build_generation_csv_path(category, aspect, args, model_tag):
         )
     if args.reft_specialists:
         return str(Path(output_dir) / f"{model_tag}-{aspect}.csv")
+    if args.caa_vector_dir or args.caa_vector_dirs:
+        return str(Path(output_dir) / f"{model_tag}-{aspect}.csv")
     return build_output_path(
         output_dir=output_dir,
         base_model_path=args.base_model,
@@ -1000,6 +1044,13 @@ def main():
                 "base_model": args.base_model,
                 "reft_weights": args.reft_weights,
                 "lora_weights": args.lora_weights,
+                "caa_vector_dir": args.caa_vector_dir,
+                "caa_vector_dirs": args.caa_vector_dirs,
+                "caa_layers": args.caa_layers,
+                "caa_alpha": float(args.caa_alpha),
+                "caa_token_strategy": args.caa_token_strategy,
+                "caa_composition": args.caa_composition,
+                "caa_weights": args.caa_weights,
                 "batch_size": int(args.batch_size),
                 "max_tokens": int(args.max_tokens),
                 "temperature": float(args.temperature),

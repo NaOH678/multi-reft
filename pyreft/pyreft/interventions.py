@@ -11,6 +11,28 @@ from pyvene import (
 )
 from transformers.activations import ACT2FN
 
+DEFAULT_ROUTER_FEATURE_NAMES = (
+    "rh_direction",
+    "delta_direction",
+    "mean_compat",
+    "neg_compat_mass",
+)
+
+VECTOR_ROUTER_FEATURE_NAMES = frozenset({
+    "rh_direction",
+    "delta_direction",
+})
+
+SCALAR_ROUTER_FEATURE_NAMES = frozenset({
+    "rh_log_norm",
+    "delta_log_norm",
+    "delta_norm",
+    "intervention_norm",
+    "subspace_energy",
+    "mean_compat",
+    "neg_compat_mass",
+})
+
 
 class LowRankRotateLayer(torch.nn.Module):
     """A linear transformation with orthogonal initialization."""
@@ -128,9 +150,40 @@ class ComposableLoreftIntervention(
         self.score_eps = float(kwargs.get("score_eps", 1e-6))
         score_clip = kwargs.get("score_clip", None)
         self.score_clip = None if score_clip is None else float(score_clip)
+        specialist_score_bias = kwargs.get("specialist_score_bias")
+        if specialist_score_bias is not None:
+            specialist_score_bias = torch.as_tensor(specialist_score_bias, dtype=torch.float32).view(-1)
+            if specialist_score_bias.numel() != self.num_specialists:
+                raise ValueError(
+                    "specialist_score_bias must have length equal to num_specialists: "
+                    f"expected {self.num_specialists}, got {specialist_score_bias.numel()}."
+                )
         self.use_trainable_policy = bool(kwargs.get("use_trainable_policy", False))
+        self.enable_debug_cache = bool(kwargs.get("enable_debug_cache", True))
+        self.enable_monitor_cache = bool(kwargs.get("enable_monitor_cache", False))
+        self.compat_impl = kwargs.get("compat_impl", "optimized")
         self.dropout = torch.nn.Dropout(kwargs["dropout"] if "dropout" in kwargs else 0.0)
         self.act_fn = ACT2FN["linear"] if "act_fn" not in kwargs or kwargs["act_fn"] is None else ACT2FN[kwargs["act_fn"]]
+        router_feature_names = kwargs.get("router_feature_names")
+        if router_feature_names is None:
+            router_feature_names = list(DEFAULT_ROUTER_FEATURE_NAMES)
+        self.router_feature_names = tuple(str(name) for name in router_feature_names)
+        self.vector_router_feature_names = tuple(
+            name for name in self.router_feature_names if name in VECTOR_ROUTER_FEATURE_NAMES
+        )
+        self.scalar_router_feature_names = tuple(
+            name for name in self.router_feature_names if name in SCALAR_ROUTER_FEATURE_NAMES
+        )
+        unsupported_router_features = [
+            name
+            for name in self.router_feature_names
+            if name not in VECTOR_ROUTER_FEATURE_NAMES and name not in SCALAR_ROUTER_FEATURE_NAMES
+        ]
+        if unsupported_router_features:
+            raise ValueError(f"Unsupported router features: {unsupported_router_features}")
+        self.router_feature_eps = float(kwargs.get("router_feature_eps", 1e-6))
+        router_feature_clip = kwargs.get("router_feature_clip", 5.0)
+        self.router_feature_clip = None if router_feature_clip is None else float(router_feature_clip)
 
         self.rotate_weight = nn.Parameter(rotate_weight, requires_grad=True)
         self.source_weight = nn.Parameter(source_weight, requires_grad=True)
@@ -173,23 +226,78 @@ class ComposableLoreftIntervention(
             else None,
             persistent=False,
         )
+        self.register_buffer(
+            "specialist_score_bias",
+            specialist_score_bias.detach().clone().to(torch.float32) if specialist_score_bias is not None else None,
+            persistent=False,
+        )
+
+        router_feature_stats = kwargs.get("router_feature_stats") or {}
+        router_feature_stat_names = router_feature_stats.get("feature_names") or list(self.router_feature_names)
+        self.router_feature_stat_names = tuple(str(name) for name in router_feature_stat_names)
+        router_feature_mean = router_feature_stats.get("mean")
+        router_feature_std = router_feature_stats.get("std")
+        self.register_buffer(
+            "router_feature_mean",
+            router_feature_mean.detach().clone().to(torch.float32) if router_feature_mean is not None else None,
+            persistent=False,
+        )
+        self.register_buffer(
+            "router_feature_std",
+            router_feature_std.detach().clone().to(torch.float32) if router_feature_std is not None else None,
+            persistent=False,
+        )
 
         policy_hidden_dim = int(kwargs.get("policy_hidden_dim", 32))
+        policy_projection_dim = int(kwargs.get("policy_projection_dim", 32))
+        self.use_pre_hidden_state_feature = bool(kwargs.get("use_pre_hidden_state_feature", False))
+        self.pre_hidden_state_dim = int(kwargs.get("pre_hidden_state_dim", 64))
+        self.policy_projection_dim = policy_projection_dim
         if self.use_trainable_policy:
-            feature_dim = 5
+            vector_input_dim = self.low_rank_dimension * len(self.vector_router_feature_names)
+            scalar_input_dim = len(self.scalar_router_feature_names)
+            hidden_input_dim = self.pre_hidden_state_dim if self.use_pre_hidden_state_feature else 0
+            projected_dim = policy_projection_dim if vector_input_dim > 0 else 0
+            feature_dim = projected_dim + scalar_input_dim + hidden_input_dim
+            if feature_dim <= 0:
+                raise ValueError("Trainable policy requires at least one router feature.")
+            if vector_input_dim > 0:
+                self.specialist_proj_weight = nn.Parameter(
+                    torch.empty(self.num_specialists, policy_projection_dim, vector_input_dim, dtype=dtype),
+                    requires_grad=True,
+                )
+                self.specialist_proj_bias = nn.Parameter(
+                    torch.zeros(self.num_specialists, policy_projection_dim, dtype=dtype),
+                    requires_grad=True,
+                )
+                nn.init.xavier_uniform_(self.specialist_proj_weight)
+            else:
+                self.specialist_proj_weight = None
+                self.specialist_proj_bias = None
+            if self.use_pre_hidden_state_feature:
+                self.pre_hidden_proj = nn.Linear(self.embed_dim, self.pre_hidden_state_dim).to(dtype)
+            else:
+                self.pre_hidden_proj = None
             self.policy_head = nn.Sequential(
                 nn.Linear(feature_dim, policy_hidden_dim),
                 nn.ReLU(),
                 nn.Linear(policy_hidden_dim, 1),
             ).to(dtype)
         else:
+            self.specialist_proj_weight = None
+            self.specialist_proj_bias = None
+            self.pre_hidden_proj = None
             self.policy_head = None
 
         self.latest_alpha = None
+        self.latest_policy_alpha = None
         self.latest_scores = None
         self.latest_normalized_score = None
+        self.latest_effective_scores = None
+        self.latest_score_bias = None
         self.latest_delta_norm = None
         self.latest_intervention_norm = None
+        self.latest_subspace_energy = None
         self.latest_pairwise_cos = None
         self.latest_selected_mask = None
         self.latest_topk_mask = None
@@ -201,6 +309,7 @@ class ComposableLoreftIntervention(
         self.latest_score_stats_source = None
         self.latest_shared_basis_stats = None
         self.latest_transport_stats = None
+        self.latest_monitor_alpha = None
 
     def freeze_specialists(self):
         self.rotate_weight.requires_grad = False
@@ -208,12 +317,26 @@ class ComposableLoreftIntervention(
         self.source_bias.requires_grad = False
 
     def freeze_policy(self):
+        if self.specialist_proj_weight is not None:
+            self.specialist_proj_weight.requires_grad = False
+        if self.specialist_proj_bias is not None:
+            self.specialist_proj_bias.requires_grad = False
+        if self.pre_hidden_proj is not None:
+            for param in self.pre_hidden_proj.parameters():
+                param.requires_grad = False
         if self.policy_head is None:
             return
         for param in self.policy_head.parameters():
             param.requires_grad = False
 
     def unfreeze_policy(self):
+        if self.specialist_proj_weight is not None:
+            self.specialist_proj_weight.requires_grad = True
+        if self.specialist_proj_bias is not None:
+            self.specialist_proj_bias.requires_grad = True
+        if self.pre_hidden_proj is not None:
+            for param in self.pre_hidden_proj.parameters():
+                param.requires_grad = True
         if self.policy_head is None:
             return
         for param in self.policy_head.parameters():
@@ -242,16 +365,16 @@ class ComposableLoreftIntervention(
         normalized = F.normalize(lifted.float(), dim=-1, eps=1e-6)
         return torch.einsum("bstd,bsud->bstu", normalized, normalized)
 
-    def _extract_policy_features(self, states):
-        delta = states["delta"]
-        lifted = states["Delta"]
-        rotated = states["rotated_base"]
+    def _needs_pairwise_features(self):
+        if self.policy_type == "compat_filtered_topk":
+            return True
+        if self.enable_debug_cache:
+            return True
+        if self.use_trainable_policy and self.policy_type == "trainable":
+            return any(name in {"mean_compat", "neg_compat_mass"} for name in self.router_feature_names)
+        return False
 
-        delta_norm = delta.float().norm(dim=-1)
-        intervention_norm = lifted.float().norm(dim=-1)
-        subspace_energy = rotated.float().pow(2).sum(dim=-1)
-        pairwise_cos = self._compute_pairwise_cos(lifted)
-
+    def _build_compatibility_features(self, pairwise_cos):
         diag = torch.eye(self.num_specialists, device=pairwise_cos.device, dtype=torch.bool).view(
             1, 1, self.num_specialists, self.num_specialists
         )
@@ -259,10 +382,35 @@ class ComposableLoreftIntervention(
         denom = max(1, self.num_specialists - 1)
         mean_compat = offdiag.sum(dim=-1) / denom
         neg_compat_mass = torch.clamp(-offdiag, min=0.0).sum(dim=-1)
+        return mean_compat, neg_compat_mass
+
+    def _extract_policy_features(self, states):
+        delta = states["delta"]
+        lifted = states["Delta"]
+        rotated = states["rotated_base"]
+
+        delta_norm = delta.float().norm(dim=-1)
+        delta_direction = delta.float() / delta_norm.unsqueeze(-1).clamp_min(self.router_feature_eps)
+        delta_log_norm = torch.log(delta_norm.clamp_min(self.router_feature_eps))
+        intervention_norm = lifted.float().norm(dim=-1)
+        rh_norm = rotated.float().norm(dim=-1)
+        rh_direction = rotated.float() / rh_norm.unsqueeze(-1).clamp_min(self.router_feature_eps)
+        rh_log_norm = torch.log(rh_norm.clamp_min(self.router_feature_eps))
+        subspace_energy = rotated.float().pow(2).sum(dim=-1)
+        pairwise_cos = None
+        mean_compat = None
+        neg_compat_mass = None
+        if self._needs_pairwise_features():
+            pairwise_cos = self._compute_pairwise_cos(lifted)
+            mean_compat, neg_compat_mass = self._build_compatibility_features(pairwise_cos)
 
         return {
             "delta_norm": delta_norm,
+            "delta_direction": delta_direction,
+            "delta_log_norm": delta_log_norm,
             "intervention_norm": intervention_norm,
+            "rh_direction": rh_direction,
+            "rh_log_norm": rh_log_norm,
             "subspace_energy": subspace_energy,
             "pairwise_cos": pairwise_cos,
             "mean_compat": mean_compat,
@@ -321,6 +469,102 @@ class ComposableLoreftIntervention(
         normalized_scores = self._normalize_scores(raw_scores, mode=norm_mode)
         return normalized_scores, normalized_scores
 
+    def _apply_specialist_score_bias(self, effective_scores):
+        if self.specialist_score_bias is None:
+            return effective_scores, None
+        score_bias = self.specialist_score_bias.float().view(1, 1, -1)
+        return effective_scores + score_bias, score_bias
+
+    def _normalize_router_features(self, feature_tensor):
+        normalized = feature_tensor.float()
+        if self.router_feature_mean is not None and self.router_feature_std is not None:
+            if tuple(self.scalar_router_feature_names) != tuple(self.router_feature_stat_names):
+                raise ValueError(
+                    "Router feature stat names mismatch: "
+                    f"model expects {self.scalar_router_feature_names}, stats provide {self.router_feature_stat_names}."
+                )
+            if self.router_feature_mean.shape[-1] != normalized.shape[-1]:
+                raise ValueError(
+                    "Router feature stats dimension mismatch: "
+                    f"expected {normalized.shape[-1]}, got {self.router_feature_mean.shape[-1]}."
+                )
+            mean = self.router_feature_mean.float().view(1, 1, self.num_specialists, -1)
+            std = self.router_feature_std.float().view(1, 1, self.num_specialists, -1).clamp_min(self.router_feature_eps)
+            normalized = (normalized - mean) / std
+        if self.router_feature_clip is not None:
+            normalized = torch.clamp(normalized, min=-self.router_feature_clip, max=self.router_feature_clip)
+        return normalized
+
+    def _assemble_scalar_router_feature_tensor(self, features):
+        parts = []
+        for feature_name in self.scalar_router_feature_names:
+            if feature_name not in features:
+                raise ValueError(f"Unsupported router feature: {feature_name}")
+            value = features[feature_name]
+            if value is None:
+                raise ValueError(
+                    f"Router feature `{feature_name}` is unavailable for policy_type={self.policy_type}. "
+                    "Check whether the required backend features are enabled."
+                )
+            parts.append(value.float().unsqueeze(-1))
+        if not parts:
+            return None
+        feature_tensor = torch.cat(parts, dim=-1)
+        return self._normalize_router_features(feature_tensor)
+
+    def _assemble_vector_router_feature_tensor(self, features):
+        parts = []
+        for feature_name in self.vector_router_feature_names:
+            if feature_name not in features:
+                raise ValueError(f"Unsupported router feature: {feature_name}")
+            value = features[feature_name]
+            if value is None:
+                raise ValueError(
+                    f"Router feature `{feature_name}` is unavailable for policy_type={self.policy_type}. "
+                    "Check whether the required backend features are enabled."
+                )
+            if value.dim() != 4:
+                raise ValueError(
+                    f"Router vector feature `{feature_name}` must have shape [B, S, T, D], got dim={value.dim()}."
+                )
+            parts.append(value.float())
+        if not parts:
+            return None
+        feature_tensor = torch.cat(parts, dim=-1)
+        if self.router_feature_clip is not None:
+            feature_tensor = torch.clamp(feature_tensor, min=-self.router_feature_clip, max=self.router_feature_clip)
+        return feature_tensor
+
+    def _project_pre_hidden_state(self, states):
+        if self.pre_hidden_proj is None:
+            return None
+        base = states["base"].float().detach()
+        normalized_base = F.layer_norm(base, (self.embed_dim,))
+        projected = self.pre_hidden_proj(normalized_base.to(self.pre_hidden_proj.weight.dtype)).float()
+        if self.router_feature_clip is not None:
+            projected = torch.clamp(projected, min=-self.router_feature_clip, max=self.router_feature_clip)
+        projected = projected.unsqueeze(2).expand(-1, -1, self.num_specialists, -1)
+        return projected
+
+    def _project_vector_router_features(self, feature_tensor):
+        if feature_tensor is None:
+            return None
+        if self.specialist_proj_weight is None or self.specialist_proj_bias is None:
+            raise ValueError("Directional router features require specialist projection weights.")
+        if feature_tensor.shape[2] != self.num_specialists:
+            raise ValueError(
+                f"Expected specialist axis size {self.num_specialists}, got {feature_tensor.shape[2]}."
+            )
+        projected = torch.einsum(
+            "bstf,tpf->bstp",
+            feature_tensor.to(self.specialist_proj_weight.dtype),
+            self.specialist_proj_weight,
+        )
+        projected = projected + self.specialist_proj_bias.unsqueeze(0).unsqueeze(0)
+        if self.router_feature_clip is not None:
+            projected = torch.clamp(projected, min=-self.router_feature_clip, max=self.router_feature_clip)
+        return projected.float()
+
     def _policy_single(self, features):
         if self.single_index is None:
             raise ValueError("single policy requires `single_index`.")
@@ -354,8 +598,13 @@ class ComposableLoreftIntervention(
             default_source="intervention_norm",
         )
         effective_scores, normalized_scores = self._get_effective_scores(raw_scores)
+        effective_scores, score_bias = self._apply_specialist_score_bias(effective_scores)
         alpha = torch.softmax(effective_scores / max(self.temperature, 1e-6), dim=-1)
-        return alpha, raw_scores, normalized_scores, {"score_source": score_source}
+        return alpha, raw_scores, normalized_scores, {
+            "score_source": score_source,
+            "effective_scores": effective_scores,
+            "score_bias": score_bias,
+        }
 
     def _policy_topk_residual(self, features):
         scores = features["delta_norm"]
@@ -376,16 +625,63 @@ class ComposableLoreftIntervention(
             default_source="delta_norm",
         )
         effective_scores, normalized_scores = self._get_effective_scores(raw_scores)
+        effective_scores, score_bias = self._apply_specialist_score_bias(effective_scores)
         pairwise_cos = features["pairwise_cos"]
+        if pairwise_cos is None:
+            raise ValueError("compat_filtered_topk requires pairwise compatibility features.")
         topk = self.topk if self.topk is not None else 1
         topk = min(int(topk), self.num_specialists)
         _, indices = torch.topk(effective_scores, k=topk, dim=-1)
-        mask = torch.zeros_like(raw_scores, dtype=torch.bool)
         topk_mask = torch.zeros_like(raw_scores, dtype=torch.bool)
         topk_mask.scatter_(dim=-1, index=indices, value=True)
-        rejected_conflict_mask = torch.zeros_like(raw_scores, dtype=torch.bool)
+        if self.compat_impl == "optimized" and topk <= 2:
+            mask, rejected_conflict_mask = self._build_compat_masks_topk2(pairwise_cos, indices, raw_scores.shape)
+        else:
+            mask, rejected_conflict_mask = self._build_compat_masks_legacy(pairwise_cos, indices, raw_scores.shape)
 
-        batch_size, num_positions, _ = raw_scores.shape
+        alpha = self._masked_softmax(effective_scores / max(self.temperature, 1e-6), mask)
+        return alpha, raw_scores, normalized_scores, {
+            "score_source": score_source,
+            "effective_scores": effective_scores,
+            "score_bias": score_bias,
+            "topk_mask": topk_mask,
+            "selected_mask": mask,
+            "rejected_conflict_mask": rejected_conflict_mask,
+        }
+
+    def _build_compat_masks_topk2(self, pairwise_cos, indices, raw_score_shape):
+        selected_mask = torch.zeros(raw_score_shape, device=pairwise_cos.device, dtype=torch.bool)
+        rejected_conflict_mask = torch.zeros_like(selected_mask)
+
+        first_idx = indices[..., :1]
+        selected_mask.scatter_(dim=-1, index=first_idx, value=True)
+
+        if indices.shape[-1] >= 2:
+            second_idx = indices[..., 1:2]
+            second_rows = pairwise_cos.gather(
+                dim=-2,
+                index=second_idx.unsqueeze(-1).expand(-1, -1, -1, self.num_specialists),
+            )
+            compat_second_first = second_rows.gather(
+                dim=-1,
+                index=first_idx.unsqueeze(-1),
+            ).squeeze(-1)
+            keep_second = compat_second_first >= self.compat_threshold
+            second_keep_mask = torch.zeros_like(selected_mask)
+            second_keep_mask.scatter_(dim=-1, index=second_idx, src=keep_second)
+            selected_mask |= second_keep_mask
+
+            second_reject_mask = torch.zeros_like(selected_mask)
+            second_reject_mask.scatter_(dim=-1, index=second_idx, src=~keep_second)
+            rejected_conflict_mask |= second_reject_mask
+
+        return selected_mask, rejected_conflict_mask
+
+    def _build_compat_masks_legacy(self, pairwise_cos, indices, raw_score_shape):
+        mask = torch.zeros(raw_score_shape, device=pairwise_cos.device, dtype=torch.bool)
+        rejected_conflict_mask = torch.zeros_like(mask)
+
+        batch_size, num_positions, _ = raw_score_shape
         for b in range(batch_size):
             for s in range(num_positions):
                 chosen = []
@@ -404,35 +700,33 @@ class ComposableLoreftIntervention(
                     chosen.append(fallback)
                     rejected_conflict_mask[b, s, fallback] = False
                 mask[b, s, chosen] = True
+        return mask, rejected_conflict_mask
 
-        alpha = self._masked_softmax(effective_scores / max(self.temperature, 1e-6), mask)
-        return alpha, raw_scores, normalized_scores, {
-            "score_source": score_source,
-            "topk_mask": topk_mask,
-            "selected_mask": mask,
-            "rejected_conflict_mask": rejected_conflict_mask,
-        }
-
-    def _policy_trainable(self, features):
+    def _policy_trainable(self, states, features):
         if self.policy_head is None:
             raise ValueError("Trainable policy requested without policy_head.")
-        feature_tensor = torch.stack(
-            [
-                features["delta_norm"],
-                features["intervention_norm"],
-                features["subspace_energy"],
-                features["mean_compat"],
-                features["neg_compat_mass"],
-            ],
-            dim=-1,
-        ).to(self.source_weight.dtype)
+        scalar_feature_tensor = self._assemble_scalar_router_feature_tensor(features)
+        vector_feature_tensor = self._assemble_vector_router_feature_tensor(features)
+        projected_vector_tensor = self._project_vector_router_features(vector_feature_tensor)
+        projected_pre_hidden_tensor = self._project_pre_hidden_state(states)
+
+        feature_parts = []
+        if projected_vector_tensor is not None:
+            feature_parts.append(projected_vector_tensor)
+        if scalar_feature_tensor is not None:
+            feature_parts.append(scalar_feature_tensor)
+        if projected_pre_hidden_tensor is not None:
+            feature_parts.append(projected_pre_hidden_tensor)
+        if not feature_parts:
+            raise ValueError("Trainable router received no usable features.")
+        feature_tensor = torch.cat(feature_parts, dim=-1).to(self.source_weight.dtype)
         logits = self.policy_head(feature_tensor).squeeze(-1).float()
         alpha = torch.softmax(logits, dim=-1)
         return alpha, logits, None, None
 
     def _compute_alpha(self, states, features):
         if self.use_trainable_policy and self.policy_type == "trainable":
-            return self._policy_trainable(features)
+            return self._policy_trainable(states, features)
         if self.policy_type == "single":
             return self._policy_single(features)
         if self.policy_type == "equal":
@@ -480,13 +774,26 @@ class ComposableLoreftIntervention(
         return torch.einsum("bsk,kd->bsd", latent_mix, basis)
 
     def _cache_debug_tensors(self, features, alpha, scores, normalized_score=None, policy_debug=None):
+        if not self.enable_debug_cache:
+            return
         policy_debug = policy_debug or {}
         self.latest_alpha = alpha.detach().cpu()
         self.latest_scores = scores.detach().cpu()
         self.latest_normalized_score = normalized_score.detach().cpu() if normalized_score is not None else None
+        effective_scores = policy_debug.get("effective_scores")
+        if effective_scores is None:
+            effective_scores = normalized_score if normalized_score is not None else scores
+        self.latest_effective_scores = effective_scores.detach().cpu() if effective_scores is not None else None
+        score_bias = policy_debug.get("score_bias")
+        self.latest_score_bias = score_bias.detach().cpu() if score_bias is not None else None
         self.latest_delta_norm = features["delta_norm"].detach().cpu()
         self.latest_intervention_norm = features["intervention_norm"].detach().cpu()
-        self.latest_pairwise_cos = features["pairwise_cos"].detach().cpu()
+        self.latest_subspace_energy = (
+            features["subspace_energy"].detach().cpu() if features.get("subspace_energy") is not None else None
+        )
+        self.latest_pairwise_cos = (
+            features["pairwise_cos"].detach().cpu() if features.get("pairwise_cos") is not None else None
+        )
         selected_mask = policy_debug.get("selected_mask")
         if selected_mask is None:
             selected_mask = alpha > 0
@@ -497,14 +804,17 @@ class ComposableLoreftIntervention(
         self.latest_rejected_conflict_mask = (
             rejected_conflict_mask.detach().cpu() if rejected_conflict_mask is not None else None
         )
-        if self.policy_type == "compat_filtered_topk":
+        if self.policy_type == "compat_filtered_topk" and features.get("pairwise_cos") is not None:
             self.latest_conflict_pair_mask = (features["pairwise_cos"] < self.compat_threshold).detach().cpu()
         else:
             self.latest_conflict_pair_mask = None
-        pairwise = features["pairwise_cos"]
-        alpha_pairs = alpha.unsqueeze(-1) * alpha.unsqueeze(-2)
-        conflict = (alpha_pairs * torch.clamp(-pairwise, min=0.0)).sum(dim=(-1, -2))
-        self.latest_conflict_score = conflict.detach().cpu()
+        pairwise = features.get("pairwise_cos")
+        if pairwise is not None:
+            alpha_pairs = alpha.unsqueeze(-1) * alpha.unsqueeze(-2)
+            conflict = (alpha_pairs * torch.clamp(-pairwise, min=0.0)).sum(dim=(-1, -2))
+            self.latest_conflict_score = conflict.detach().cpu()
+        else:
+            self.latest_conflict_score = None
         self.latest_compose_domain = self.compose_domain
         self.latest_score_source = policy_debug.get("score_source") or self.score_source or "delta_norm"
         self.latest_score_stats_source = self.score_stats_source
@@ -522,6 +832,12 @@ class ComposableLoreftIntervention(
             }
         else:
             self.latest_transport_stats = None
+
+    def _cache_monitor_tensors(self, alpha):
+        self.latest_policy_alpha = alpha
+        if not self.enable_monitor_cache:
+            return
+        self.latest_monitor_alpha = alpha.detach()
 
     def forward(self, base, source=None, subspaces=None, **kwargs):
         states = self._compute_specialist_states(base)
@@ -544,6 +860,7 @@ class ComposableLoreftIntervention(
             normalized_score=normalized_score,
             policy_debug=policy_debug,
         )
+        self._cache_monitor_tensors(alpha)
         output = base + mixed.to(base.dtype)
         return self.dropout(output.to(base.dtype))
 
@@ -559,6 +876,13 @@ class ComposableLoreftIntervention(
         if self.policy_head is not None:
             for k, v in self.policy_head.state_dict().items():
                 state_dict[f"policy_head.{k}"] = v
+        if self.pre_hidden_proj is not None:
+            for k, v in self.pre_hidden_proj.state_dict().items():
+                state_dict[f"pre_hidden_proj.{k}"] = v
+        if self.specialist_proj_weight is not None:
+            state_dict["specialist_proj_weight"] = self.specialist_proj_weight.data
+        if self.specialist_proj_bias is not None:
+            state_dict["specialist_proj_bias"] = self.specialist_proj_bias.data
         return state_dict
 
     def load_state_dict(self, state_dict, *args, **kwargs):
@@ -572,6 +896,18 @@ class ComposableLoreftIntervention(
             self.shared_basis.data.copy_(state_dict["shared_basis"].to(self.shared_basis.device))
         if self.transport_weight is not None and "transport_weight" in state_dict:
             self.transport_weight.data.copy_(state_dict["transport_weight"].to(self.transport_weight.device))
+        if self.specialist_proj_weight is not None and "specialist_proj_weight" in state_dict:
+            self.specialist_proj_weight.data.copy_(state_dict["specialist_proj_weight"].to(self.specialist_proj_weight.device))
+        if self.specialist_proj_bias is not None and "specialist_proj_bias" in state_dict:
+            self.specialist_proj_bias.data.copy_(state_dict["specialist_proj_bias"].to(self.specialist_proj_bias.device))
+        if self.pre_hidden_proj is not None:
+            pre_hidden_state = {
+                k[len("pre_hidden_proj."):]: v
+                for k, v in state_dict.items()
+                if k.startswith("pre_hidden_proj.")
+            }
+            if pre_hidden_state:
+                self.pre_hidden_proj.load_state_dict(pre_hidden_state, strict=False)
         if self.policy_head is not None:
             policy_state = {
                 k[len("policy_head."):]: v

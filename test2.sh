@@ -1,0 +1,26 @@
+# -----------------------------------------------------------------------------
+# case study 
+# -----------------------------------------------------------------------------
+PARTITION=wam_agent \
+BASE_MODEL=models/llama3-8b/snapshots/8cde5ca8380496c9a6cc7ef3a8b46a0372a1d920 \
+SPEC1=multi_train/trainer_output/Llama3-8b-Loreft_truthful_4/checkpoint-3330/intervenable_model \
+SPEC2=multi_train/trainer_output/Llama3-8b-Loreft_moral/checkpoint-330/intervenable_model \
+SPEC3=multi_train/trainer_output/Llama3-8b-Loreft_stereotype_1/checkpoint-160/intervenable_model \
+SPEC4=multi_train/trainer_output/Llama3-8b-Loreft_toxicity/checkpoint-235/intervenable_model \
+SCORE_STATS_PATH=multi_train/calibration/train_input/stats/intervention_stats_specialist_train_input.json \
+COMPOSITION_METHOD=compat_filtered_topk \
+SCORE_SOURCE=intervention_norm \
+SCORE_NORMALIZER=log_zscore \
+COMPOSITION_TOPK=2 \
+COMPAT_THRESHOLD=0.0 \
+TOXICITY_TRUTHFUL_SCORE_PENALTY=0.7 \
+TARGET_LAYERS="-1" \
+GPU_IDS="0" \
+MAX_SAMPLES=200 \
+TOXICITY_SAMPLE_MODE=random \
+TOXICITY_SAMPLE_SEED=42 \
+TOXICITY_MECHANISM_TRACE=1 \
+MERGE_SUMMARY_PATH=Llama3-8b-Composable-E6-toxpen07-mech200_true \
+HOST_LOG_DIR=multi_train/logs/Llama3-8b-Composable-E6-toxpen07-mech200_true \
+LOG_DIR=multi_train/logs/Llama3-8b-Composable-E6-toxpen07-mech200_true/tasks \
+bash multi_train/script/evaluate_composable_toxicity_case_study_submit.sh

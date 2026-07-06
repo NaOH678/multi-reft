@@ -42,9 +42,21 @@ from multi_train.eval_common.output_naming import build_output_path
 from multi_train.eval_common.output_naming import build_model_tag
 from multi_train.eval_common.composable_loreft import (
     build_composable_model_tag,
+    build_trained_router_model_tag,
     load_composed_reft_model,
+    load_mixed_composed_reft_model,
+    load_router_training_metadata,
+    load_trained_router_reft_model,
     normalize_specialist_label,
 )
+from baseline.CAA_0.steering import apply_caa_steering, build_caa_model_tag
+from baseline.iti_0.steering import apply_iti_steering, build_iti_model_tag
+from baseline.repe_0.steering import apply_repe_steering, build_repe_model_tag
+from baseline.pyvene_additive_common import (
+    apply_pyvene_additive_steering,
+    build_pyvene_model_tag,
+)
+from baseline.truth_label_utils import parse_labeled_choices
 
 def str2bool(v):
     if isinstance(v, bool):
@@ -56,6 +68,30 @@ def str2bool(v):
         if v in {"false", "0", "no", "n", "f"}:
             return False
     raise argparse.ArgumentTypeError("Boolean value expected.")
+
+
+def _sorted_unique_ints(values):
+    if not values:
+        return []
+    return sorted({int(value) for value in values})
+
+
+def _use_pyvene_additive(args) -> bool:
+    return bool(args.pyvene_vector_dir or args.pyvene_vector_dirs)
+
+
+def clean_generation_output(text: str) -> str:
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return cleaned
+
+    lines = [line.strip() for line in re.split(r"[\r\n]+", cleaned) if line.strip()]
+    if lines:
+        first_line = lines[0].lower()
+        if re.fullmatch(r"(?:answer\d+)(?:/(?:answer\d+))+", first_line):
+            lines = lines[1:]
+            cleaned = "\n".join(lines).strip()
+    return cleaned
 
 
 def _unwrap_intervention(intervention_value):
@@ -307,17 +343,27 @@ def main(
     args = parse_args()
     args.reft_weights = args.reft_weights or None
     args.lora_weights = args.lora_weights or None
+    args.router_checkpoint_dir = args.router_checkpoint_dir or None
+    args.router_metadata_path = args.router_metadata_path or None
+    args.base_score_stats_path = args.base_score_stats_path or None
+    args.router_feature_stats_path = args.router_feature_stats_path or None
     if args.reft_specialists:
         args.reft_specialists = [path for path in args.reft_specialists if str(path).strip()]
         if len(args.reft_specialists) == 0:
             args.reft_specialists = None
     if args.reft_weights and args.lora_weights:
         raise ValueError("`reft_weights` and `lora_weights` cannot be used at the same time.")
+    if args.router_checkpoint_dir and args.reft_weights:
+        raise ValueError("`router_checkpoint_dir` and `reft_weights` cannot be used at the same time.")
+    if args.router_checkpoint_dir and args.reft_specialists:
+        raise ValueError("`router_checkpoint_dir` and `reft_specialists` cannot be used at the same time.")
+    if args.router_checkpoint_dir and args.lora_weights:
+        raise ValueError("`router_checkpoint_dir` and `lora_weights` cannot be used at the same time.")
     if args.reft_specialists and args.reft_weights:
         raise ValueError("`reft_specialists` and `reft_weights` cannot be used at the same time.")
     if args.reft_specialists and args.lora_weights:
         raise ValueError("`reft_specialists` and `lora_weights` cannot be used at the same time.")
-    use_reft = bool(args.reft_weights or args.reft_specialists)
+    use_reft = bool(args.reft_weights or args.reft_specialists or args.router_checkpoint_dir)
 
     
     if torch.cuda.is_available():
@@ -412,17 +458,30 @@ def main(
                     )
         
         outputs = tokenizer.batch_decode(response, skip_special_tokens=True)
-        print(outputs)
-        outputs = [o.split("### Response:")[1].strip() for o in outputs]
-        print(outputs)
+        cleaned_outputs = []
+        for prompt, output in zip(prompts, outputs):
+            text = str(output)
+            if text.startswith(prompt):
+                text = text[len(prompt):]
+            elif "### Response:" in text:
+                text = text.split("### Response:")[-1]
+            cleaned_outputs.append(clean_generation_output(text))
+        outputs = cleaned_outputs
         return outputs
     
     
     output_dir = "./multi_train/eval_truth"
     os.makedirs(output_dir, exist_ok=True)
 
-    if args.reft_specialists:
-        specialist_labels = [normalize_specialist_label(path) for path in args.reft_specialists]
+    if args.router_checkpoint_dir:
+        specialist_labels = resolve_specialist_labels(args)
+        model_tag = build_trained_router_model_tag(
+            base_model_path=args.base_model,
+            router_checkpoint_dir=args.router_checkpoint_dir,
+        )
+        save_file = args.results_json or str(Path(output_dir) / f"{model_tag}-{args.dataset}.json")
+    elif args.reft_specialists:
+        specialist_labels = resolve_specialist_labels(args)
         model_tag = build_composable_model_tag(
             base_model_path=args.base_model,
             specialist_dirs=args.reft_specialists,
@@ -439,23 +498,79 @@ def main(
             score_normalizer=args.score_normalizer,
             score_stats_path=args.score_stats_path,
             score_clip=args.score_clip,
+            truthful_score_penalty=args.truthful_score_penalty,
         )
-        save_file = str(Path(output_dir) / f"{model_tag}-{args.dataset}.json")
+        if args.forced_single_layers:
+            forced_layers_tag = "_".join(str(layer) for layer in args.forced_single_layers)
+            model_tag = f"{model_tag}-mixedsingle{args.forced_single_index}-l{forced_layers_tag}"
+        save_file = args.results_json or str(Path(output_dir) / f"{model_tag}-{args.dataset}.json")
     else:
         specialist_labels = []
-        model_tag = build_model_tag(
-            base_model_path=args.base_model,
-            reft_weights_path=args.reft_weights,
-            lora_weights_path=args.lora_weights,
-        )
-        save_file = build_output_path(
-            output_dir=output_dir,
-            base_model_path=args.base_model,
-            reft_weights_path=args.reft_weights,
-            lora_weights_path=args.lora_weights,
-            suffix=f"-{args.dataset}",
-            ext=".json",
-        )
+        if args.caa_vector_dir or args.caa_vector_dirs:
+            model_tag = build_caa_model_tag(
+                base_model_path=args.base_model,
+                vector_dir=args.caa_vector_dir,
+                vector_dirs=args.caa_vector_dirs,
+                layers=args.caa_layers,
+                alpha=args.caa_alpha,
+                token_strategy=args.caa_token_strategy,
+                composition=args.caa_composition,
+                weights=args.caa_weights,
+            )
+            save_file = args.results_json or str(Path(output_dir) / f"{model_tag}-{args.dataset}.json")
+        elif args.iti_artifact_dir or args.iti_artifact_dirs:
+            model_tag = build_iti_model_tag(
+                base_model_path=args.base_model,
+                artifact_dir=args.iti_artifact_dir,
+                artifact_dirs=args.iti_artifact_dirs,
+                alpha=args.iti_alpha,
+                token_strategy=args.iti_token_strategy,
+                include_prompt=bool(args.iti_include_prompt),
+                composition=args.iti_composition,
+                weights=args.iti_weights,
+            )
+            save_file = args.results_json or str(Path(output_dir) / f"{model_tag}-{args.dataset}.json")
+        elif args.repe_vector_dir or args.repe_vector_dirs:
+            model_tag = build_repe_model_tag(
+                base_model_path=args.base_model,
+                vector_dir=args.repe_vector_dir,
+                vector_dirs=args.repe_vector_dirs,
+                layers=args.repe_layers,
+                alpha=args.repe_alpha,
+                token_strategy=args.repe_token_strategy,
+                composition=args.repe_composition,
+                weights=args.repe_weights,
+            )
+            save_file = args.results_json or str(Path(output_dir) / f"{model_tag}-{args.dataset}.json")
+        elif _use_pyvene_additive(args):
+            model_tag = build_pyvene_model_tag(
+                method_tag=args.pyvene_method_tag,
+                base_model_path=args.base_model,
+                vector_dir=args.pyvene_vector_dir,
+                vector_dirs=args.pyvene_vector_dirs,
+                layers=args.pyvene_layers,
+                alpha=args.pyvene_alpha,
+                component=args.pyvene_component,
+                composition=args.pyvene_composition,
+                weights=args.pyvene_weights,
+                intervene_on_prompt=bool(args.pyvene_intervene_on_prompt),
+                base_unit_location=args.pyvene_base_unit_location,
+            )
+            save_file = args.results_json or str(Path(output_dir) / f"{model_tag}-{args.dataset}.json")
+        else:
+            model_tag = build_model_tag(
+                base_model_path=args.base_model,
+                reft_weights_path=args.reft_weights,
+                lora_weights_path=args.lora_weights,
+            )
+            save_file = args.results_json or build_output_path(
+                output_dir=output_dir,
+                base_model_path=args.base_model,
+                reft_weights_path=args.reft_weights,
+                lora_weights_path=args.lora_weights,
+                suffix=f"-{args.dataset}",
+                ext=".json",
+            )
     if args.summary_file:
         summary_file = args.summary_file
     else:
@@ -475,14 +590,33 @@ def main(
     for idx, batch in enumerate(batches):
         current += len(batch)
         instructions = [data.get('instruction') for data in batch]
-
-        outputs = evaluate(instructions)
+        pairwise_mode = (
+            args.truth_eval_mode == "pairwise"
+            and args.dataset in ['truthfulqa_mc', 'truthfulqa_mc_dev']
+        )
+        if pairwise_mode:
+            pair_tasks = prepare_pairwise_truth_tasks(batch)
+            pair_outputs = []
+            pair_batches = create_batch(pair_tasks, args.batch_size)
+            for pair_batch in pair_batches:
+                pair_instructions = [data['instruction'] for data in pair_batch]
+                pair_outputs.extend(evaluate(pair_instructions))
+            outputs = aggregate_pairwise_truth_predictions(args, batch, pair_tasks, pair_outputs)
+        else:
+            raw_outputs = evaluate(instructions)
+            outputs = [{"output_pred": output, "pred": None} for output in raw_outputs]
         _update_debug_accumulator(debug_accumulator, model)
 
-        for data, output in zip(batch, outputs):
+        for data, output_bundle in zip(batch, outputs):
             label = data.get('answer')
             flag = False
-            predict = extract_answer(args, output)
+            if pairwise_mode:
+                output = output_bundle.get('output_pred', '')
+                predict = output_bundle.get('pred', '')
+            else:
+                output = output_bundle.get('output_pred', '')
+                args._current_instruction_for_parse = data.get("instruction")
+                predict = extract_answer(args, output)
             if label == predict:
                 correct += 1
                 flag = True
@@ -490,14 +624,18 @@ def main(
             new_data['output_pred'] = output
             new_data['pred'] = predict
             new_data['flag'] = flag
+            if pairwise_mode:
+                new_data['pairwise_vote_scores'] = output_bundle.get('pairwise_vote_scores', {})
+                new_data['pairwise_prompt_count'] = output_bundle.get('pairwise_prompt_count', 0)
+                new_data['pairwise_parsed_count'] = output_bundle.get('pairwise_parsed_count', 0)
+                new_data['pairwise_examples'] = output_bundle.get('pairwise_examples', [])
             output_data.append(new_data)
-            print(data["instruction"])
-            print(output)
-            print('prediction:', predict)
-            print('label:', label)
-        print('---------------')
+            if args.print_samples:
+                print(data["instruction"])
+                print(output)
+                print('prediction:', predict)
+                print('label:', label)
         print(f'\rtest:{idx + 1}/{total} | accuracy {correct}  {correct / current}')
-        print('---------------')
         with open(save_file, 'w+') as f:
             json.dump(output_data, f, indent=4)
         pbar.update(1)
@@ -522,11 +660,47 @@ def main(
         "correct": correct,
         "accuracy": accuracy,
         "greedy_decoding": bool(args.greedy_decoding),
+        "truth_eval_mode": args.truth_eval_mode,
         "batch_size": args.batch_size,
         "base_model": args.base_model,
         "reft_weights": args.reft_weights,
         "lora_weights": args.lora_weights,
+        "caa_vector_dir": args.caa_vector_dir,
+        "caa_vector_dirs": args.caa_vector_dirs,
+        "caa_layers": args.caa_layers,
+        "caa_alpha": args.caa_alpha,
+        "caa_token_strategy": args.caa_token_strategy,
+        "caa_composition": args.caa_composition,
+        "caa_weights": args.caa_weights,
+        "iti_artifact_dir": args.iti_artifact_dir,
+        "iti_artifact_dirs": args.iti_artifact_dirs,
+        "iti_alpha": args.iti_alpha,
+        "iti_token_strategy": args.iti_token_strategy,
+        "iti_include_prompt": bool(args.iti_include_prompt),
+        "iti_composition": args.iti_composition,
+        "iti_weights": args.iti_weights,
+        "repe_vector_dir": args.repe_vector_dir,
+        "repe_vector_dirs": args.repe_vector_dirs,
+        "repe_layers": args.repe_layers,
+        "repe_alpha": args.repe_alpha,
+        "repe_token_strategy": args.repe_token_strategy,
+        "repe_composition": args.repe_composition,
+        "repe_weights": args.repe_weights,
+        "pyvene_method_tag": args.pyvene_method_tag,
+        "pyvene_component": args.pyvene_component,
+        "pyvene_vector_dir": args.pyvene_vector_dir,
+        "pyvene_vector_dirs": args.pyvene_vector_dirs,
+        "pyvene_layers": args.pyvene_layers,
+        "pyvene_alpha": args.pyvene_alpha,
+        "pyvene_composition": args.pyvene_composition,
+        "pyvene_weights": args.pyvene_weights,
+        "pyvene_intervene_on_prompt": bool(args.pyvene_intervene_on_prompt),
+        "pyvene_base_unit_location": args.pyvene_base_unit_location,
         "reft_specialists": args.reft_specialists,
+        "router_checkpoint_dir": args.router_checkpoint_dir,
+        "router_metadata_path": args.router_metadata_path,
+        "base_score_stats_path": args.base_score_stats_path,
+        "router_feature_stats_path": args.router_feature_stats_path,
         "compose_domain": args.compose_domain,
         "composition_method": args.composition_method,
         "composition_temperature": args.composition_temperature,
@@ -541,6 +715,9 @@ def main(
         "score_stats_path": args.score_stats_path,
         "score_eps": args.score_eps,
         "score_clip": args.score_clip,
+        "truthful_score_penalty": args.truthful_score_penalty,
+        "forced_single_layers": args.forced_single_layers,
+        "forced_single_index": args.forced_single_index,
         "composable_config": {
             "specialist_labels": specialist_labels,
             "compose_domain": args.compose_domain,
@@ -557,7 +734,18 @@ def main(
             "score_stats_path": args.score_stats_path,
             "score_eps": args.score_eps,
             "score_clip": args.score_clip,
-        } if args.reft_specialists else None,
+            "truthful_score_penalty": args.truthful_score_penalty,
+            "forced_single_layers": args.forced_single_layers,
+            "forced_single_index": args.forced_single_index,
+        } if args.reft_specialists else (
+            {
+                "specialist_labels": specialist_labels,
+                "router_checkpoint_dir": args.router_checkpoint_dir,
+                "router_metadata_path": args.router_metadata_path,
+                "base_score_stats_path": args.base_score_stats_path,
+                "router_feature_stats_path": args.router_feature_stats_path,
+            } if args.router_checkpoint_dir else None
+        ),
         "debug_summary_file": debug_summary_file,
         "model_tag": model_tag,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -589,6 +777,100 @@ completes the request.
     return prompt_no_input_template % instruction
 
 
+def extract_truth_question_header(instruction: str) -> str:
+    text = str(instruction or "").strip()
+    match = re.search(r"\banswer1\s*:", text, flags=re.IGNORECASE)
+    if not match:
+        return text
+    return text[: match.start()].rstrip()
+
+
+def build_pairwise_truth_instruction(header: str, option_a: str, option_b: str) -> str:
+    return (
+        f"{header}\n\n"
+        f"Answer1: {option_a}\n"
+        f"Answer2: {option_b}\n\n"
+        "Answer format: answer1/answer2"
+    ).strip()
+
+
+def prepare_pairwise_truth_tasks(batch: list[dict]) -> list[dict]:
+    pair_tasks = []
+    for sample_idx, row in enumerate(batch):
+        instruction = str(row.get("instruction", "") or "").strip()
+        option_map = parse_labeled_choices(instruction)
+        ordered_labels = sorted(
+            option_map.keys(),
+            key=lambda label: int(re.search(r"(\d+)$", label).group(1)) if re.search(r"(\d+)$", label) else 10**9,
+        )
+        header = extract_truth_question_header(instruction)
+        for left_label, right_label in itertools.combinations(ordered_labels, 2):
+            left_text = option_map[left_label]
+            right_text = option_map[right_label]
+            forward_instruction = build_pairwise_truth_instruction(header, left_text, right_text)
+            reverse_instruction = build_pairwise_truth_instruction(header, right_text, left_text)
+            pair_tasks.append(
+                {
+                    "sample_idx": sample_idx,
+                    "instruction": forward_instruction,
+                    "label_map": {"answer1": left_label, "answer2": right_label},
+                }
+            )
+            pair_tasks.append(
+                {
+                    "sample_idx": sample_idx,
+                    "instruction": reverse_instruction,
+                    "label_map": {"answer1": right_label, "answer2": left_label},
+                }
+            )
+    return pair_tasks
+
+
+def aggregate_pairwise_truth_predictions(args, batch: list[dict], pair_tasks: list[dict], pair_outputs: list[str]) -> list[dict]:
+    score_tables = [dict() for _ in batch]
+    pair_records = [[] for _ in batch]
+    parsed_counts = [0 for _ in batch]
+
+    for task, output in zip(pair_tasks, pair_outputs):
+        sample_idx = task["sample_idx"]
+        args._current_instruction_for_parse = task["instruction"]
+        pred = extract_answer(args, output)
+        winner = ""
+        if pred in task["label_map"]:
+            winner = task["label_map"][pred]
+            parsed_counts[sample_idx] += 1
+            score_tables[sample_idx][winner] = score_tables[sample_idx].get(winner, 0) + 1
+
+        pair_records[sample_idx].append(
+            {
+                "instruction": task["instruction"],
+                "label_map": task["label_map"],
+                "output_pred": output,
+                "pred": pred,
+                "winner": winner,
+            }
+        )
+
+    aggregated = []
+    for sample_idx, row in enumerate(batch):
+        scores = score_tables[sample_idx]
+        if scores:
+            pred = sorted(scores.items(), key=lambda item: (-item[1], item[0]))[0][0]
+        else:
+            pred = ""
+        aggregated.append(
+            {
+                "pred": pred,
+                "output_pred": json.dumps(scores, ensure_ascii=False, sort_keys=True),
+                "pairwise_vote_scores": scores,
+                "pairwise_prompt_count": len(pair_records[sample_idx]),
+                "pairwise_parsed_count": parsed_counts[sample_idx],
+                "pairwise_examples": pair_records[sample_idx],
+            }
+        )
+    return aggregated
+
+
 def load_data(args) -> list:
     """
     read data from dataset file
@@ -615,7 +897,7 @@ def create_batch(dataset, batch_size):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset', choices=["boolq", "piqa", "social_i_qa", "hellaswag", "winogrande", "ARC-Challenge", "ARC-Easy", "openbookqa", "truthfulqa_mc", "bbq"],
+    parser.add_argument('--dataset', choices=["boolq", "piqa", "social_i_qa", "hellaswag", "winogrande", "ARC-Challenge", "ARC-Easy", "openbookqa", "truthfulqa_mc", "truthfulqa_mc_dev", "bbq"],
                         required=True)
     # parser.add_argument('--model', choices=['LLaMA-7B', "LLaMA-13B",'BLOOM-7B', 'GPT-j-6B'], required=True)
     # parser.add_argument('--adapter', choices=['LoRA', 'AdapterP', 'AdapterH', 'Parallel'],
@@ -626,7 +908,43 @@ def parse_args():
     parser.add_argument('--batch_size', type=int, required=True)
     parser.add_argument('--reft_weights', type=str,default=None)
     parser.add_argument('--reft_specialists', type=str, nargs='+', default=None)
+    parser.add_argument('--router_checkpoint_dir', type=str, default=None)
+    parser.add_argument('--router_metadata_path', type=str, default=None)
+    parser.add_argument('--base_score_stats_path', type=str, default=None)
+    parser.add_argument('--router_feature_stats_path', type=str, default=None)
+    parser.add_argument('--enable_debug_cache', type=str2bool, nargs='?', const=True, default=False)
     parser.add_argument('--lora_weights', type=str,default=None)
+    parser.add_argument('--caa_vector_dir', type=str, default=None)
+    parser.add_argument('--caa_vector_dirs', type=str, nargs='+', default=None)
+    parser.add_argument('--caa_layers', type=int, nargs='+', default=None)
+    parser.add_argument('--caa_alpha', type=float, default=1.0)
+    parser.add_argument('--caa_token_strategy', choices=["last", "all"], default="last")
+    parser.add_argument('--caa_composition', choices=["single", "sum", "mean", "norm_mean", "weighted_sum"], default="single")
+    parser.add_argument('--caa_weights', type=float, nargs='+', default=None)
+    parser.add_argument('--iti_artifact_dir', type=str, default=None)
+    parser.add_argument('--iti_artifact_dirs', type=str, nargs='+', default=None)
+    parser.add_argument('--iti_alpha', type=float, default=1.0)
+    parser.add_argument('--iti_token_strategy', choices=["last", "all"], default="last")
+    parser.add_argument('--iti_include_prompt', type=int, default=0)
+    parser.add_argument('--iti_composition', choices=["single", "sum", "mean", "norm_mean", "weighted_sum"], default="single")
+    parser.add_argument('--iti_weights', type=float, nargs='+', default=None)
+    parser.add_argument('--repe_vector_dir', type=str, default=None)
+    parser.add_argument('--repe_vector_dirs', type=str, nargs='+', default=None)
+    parser.add_argument('--repe_layers', type=int, nargs='+', default=None)
+    parser.add_argument('--repe_alpha', type=float, default=1.0)
+    parser.add_argument('--repe_token_strategy', choices=["last", "all"], default="last")
+    parser.add_argument('--repe_composition', choices=["single", "sum", "mean", "norm_mean", "weighted_sum"], default="single")
+    parser.add_argument('--repe_weights', type=float, nargs='+', default=None)
+    parser.add_argument('--pyvene_method_tag', type=str, default=None)
+    parser.add_argument('--pyvene_component', type=str, default=None)
+    parser.add_argument('--pyvene_vector_dir', type=str, default=None)
+    parser.add_argument('--pyvene_vector_dirs', type=str, nargs='+', default=None)
+    parser.add_argument('--pyvene_layers', type=int, nargs='+', default=None)
+    parser.add_argument('--pyvene_alpha', type=float, default=1.0)
+    parser.add_argument('--pyvene_composition', choices=["single", "sum", "mean", "norm_mean", "weighted_sum"], default="single")
+    parser.add_argument('--pyvene_weights', type=float, nargs='+', default=None)
+    parser.add_argument('--pyvene_intervene_on_prompt', type=int, default=0)
+    parser.add_argument('--pyvene_base_unit_location', type=int, default=None)
     parser.add_argument('--compose_domain', choices=["output", "projected_output", "shared_latent"], default="output")
     parser.add_argument('--composition_method', choices=["single", "equal", "residual_softmax", "residual_scaled_softmax", "residual_logz_softmax", "intervention_softmax", "topk_residual", "compat_filtered_topk"], default="equal")
     parser.add_argument('--composition_temperature', type=float, default=1.0)
@@ -641,11 +959,17 @@ def parse_args():
     parser.add_argument('--score_stats_path', type=str, default=None)
     parser.add_argument('--score_eps', type=float, default=1e-6)
     parser.add_argument('--score_clip', type=float, default=None)
+    parser.add_argument('--truthful_score_penalty', type=float, default=0.0)
+    parser.add_argument('--forced_single_layers', type=int, nargs='+', default=None)
+    parser.add_argument('--forced_single_index', type=int, default=0)
     parser.add_argument('--positions', type=int, default=5)
     parser.add_argument('--greedy_decoding', type=str2bool, nargs='?', const=True, default=False)
     parser.add_argument('--load_8bit', action='store_true', default=False)
     parser.add_argument('--device', type=str, default='cuda:0')
+    parser.add_argument('--results_json', type=str, default=None)
     parser.add_argument('--summary_file', type=str, default=None)
+    parser.add_argument('--print_samples', type=str2bool, nargs='?', const=True, default=False)
+    parser.add_argument('--truth_eval_mode', choices=["direct", "pairwise"], default="direct")
 
     return parser.parse_args()
 
@@ -671,11 +995,34 @@ def load_model(args) -> tuple:
         print(f'load reft weight: {reft_weights}')
     if args.reft_specialists:
         print(f'load reft specialists: {args.reft_specialists}')
+    if args.forced_single_layers:
+        print(
+            "force single specialist on layers: "
+            f"{args.forced_single_layers} (single_index={args.forced_single_index})"
+        )
+    if args.router_checkpoint_dir:
+        print(f'load trained router checkpoint: {args.router_checkpoint_dir}')
     lora_weight = args.lora_weights
     if not lora_weight:
         print(f'can not find lora weight, the value is: {lora_weight}')
     else:
         print(f'load lora weight: {lora_weight}')
+    if args.caa_vector_dir:
+        print(f'load caa vectors from: {args.caa_vector_dir}')
+    if args.caa_vector_dirs:
+        print(f'load caa vectors from: {args.caa_vector_dirs}')
+    if args.iti_artifact_dir:
+        print(f'load iti artifacts from: {args.iti_artifact_dir}')
+    if args.iti_artifact_dirs:
+        print(f'load iti artifacts from: {args.iti_artifact_dirs}')
+    if args.repe_vector_dir:
+        print(f'load repe vectors from: {args.repe_vector_dir}')
+    if args.repe_vector_dirs:
+        print(f'load repe vectors from: {args.repe_vector_dirs}')
+    if args.pyvene_vector_dir:
+        print(f'load pyvene vectors from: {args.pyvene_vector_dir}')
+    if args.pyvene_vector_dirs:
+        print(f'load pyvene vectors from: {args.pyvene_vector_dirs}')
     
 
     # load_8bit = args.load_8bit
@@ -690,12 +1037,20 @@ def load_model(args) -> tuple:
             device_map=args.device,
             trust_remote_code=True,
         ) # fix zwq
+    # Avoid adding a brand-new PAD token during evaluation. Resizing embeddings
+    # on a loaded 8B model creates a large temporary allocation and can OOM.
     if tokenizer.pad_token is None:
         if tokenizer.unk_token is not None:
             tokenizer.pad_token = tokenizer.unk_token
+        elif tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+        elif tokenizer.bos_token is not None:
+            tokenizer.pad_token = tokenizer.bos_token
         else:
-            tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-            model.resize_token_embeddings(len(tokenizer))
+            raise ValueError(
+                "Tokenizer has no pad_token/unk_token/eos_token/bos_token available. "
+                "Refusing to add a new token during truth/bias evaluation because resizing embeddings is too expensive."
+            )
 
     model.config.pad_token_id = tokenizer.pad_token_id
     model.config.bos_token_id = tokenizer.bos_token_id
@@ -704,32 +1059,134 @@ def load_model(args) -> tuple:
         model.generation_config.pad_token_id = tokenizer.pad_token_id
         model.generation_config.bos_token_id = tokenizer.bos_token_id
         model.generation_config.eos_token_id = tokenizer.eos_token_id
+
+    if (args.caa_vector_dir or args.caa_vector_dirs) and (
+        args.router_checkpoint_dir
+        or args.reft_specialists
+        or reft_weights
+        or lora_weight
+        or args.iti_artifact_dir
+        or args.iti_artifact_dirs
+        or args.repe_vector_dir
+        or args.repe_vector_dirs
+        or args.pyvene_vector_dir
+        or args.pyvene_vector_dirs
+    ):
+        raise ValueError("CAA steering cannot be combined with ReFT, LoRA, router checkpoints, ITI, or RepE in evaluate_truth.py.")
+    if (args.iti_artifact_dir or args.iti_artifact_dirs) and (
+        args.router_checkpoint_dir
+        or args.reft_specialists
+        or reft_weights
+        or lora_weight
+        or args.caa_vector_dir
+        or args.caa_vector_dirs
+        or args.repe_vector_dir
+        or args.repe_vector_dirs
+        or args.pyvene_vector_dir
+        or args.pyvene_vector_dirs
+    ):
+        raise ValueError("ITI steering cannot be combined with ReFT, LoRA, router checkpoints, or CAA in evaluate_truth.py.")
+    if (args.repe_vector_dir or args.repe_vector_dirs) and (
+        args.router_checkpoint_dir
+        or args.reft_specialists
+        or reft_weights
+        or lora_weight
+        or args.caa_vector_dir
+        or args.caa_vector_dirs
+        or args.iti_artifact_dir
+        or args.iti_artifact_dirs
+        or args.pyvene_vector_dir
+        or args.pyvene_vector_dirs
+    ):
+        raise ValueError("RepE steering cannot be combined with ReFT, LoRA, router checkpoints, CAA, or ITI in evaluate_truth.py.")
+    if _use_pyvene_additive(args) and (
+        args.router_checkpoint_dir
+        or args.reft_specialists
+        or reft_weights
+        or lora_weight
+        or args.caa_vector_dir
+        or args.caa_vector_dirs
+        or args.iti_artifact_dir
+        or args.iti_artifact_dirs
+        or args.repe_vector_dir
+        or args.repe_vector_dirs
+    ):
+        raise ValueError("Pyvene additive steering cannot be combined with ReFT, LoRA, router checkpoints, CAA, ITI, or RepE in evaluate_truth.py.")
    
-    if args.reft_specialists:
+    if args.router_checkpoint_dir:
+        target_layers = None if args.target_layers == [-1] else args.target_layers
+        model = load_trained_router_reft_model(
+            model=model,
+            router_checkpoint_dir=args.router_checkpoint_dir,
+            target_layers=target_layers,
+            router_metadata_path=args.router_metadata_path,
+            base_score_stats_path=args.base_score_stats_path,
+            router_feature_stats_path=args.router_feature_stats_path,
+            enable_debug_cache=bool(args.enable_debug_cache),
+        )
+    elif args.reft_specialists:
         if args.target_layers == [-1]:
             target_layers = list(range(len(model.model.layers)))
         else:
             target_layers = args.target_layers
-
-        model = load_composed_reft_model(
-            model=model,
-            specialist_dirs=args.reft_specialists,
-            target_layers=target_layers,
-            compose_domain=args.compose_domain,
-            composition_method=args.composition_method,
-            composition_temperature=args.composition_temperature,
-            composition_topk=args.composition_topk,
-            compat_threshold=args.compat_threshold,
-            single_index=args.single_index,
-            shared_basis_type=args.shared_basis_type,
-            shared_basis_rank=args.shared_basis_rank,
-            transport_type=args.transport_type,
-            score_source=args.score_source,
-            score_normalizer=args.score_normalizer,
-            score_stats_path=args.score_stats_path,
-            score_eps=args.score_eps,
-            score_clip=args.score_clip,
-        )
+        forced_single_layers = _sorted_unique_ints(args.forced_single_layers)
+        if forced_single_layers:
+            layer_policy_specs = {
+                layer: {
+                    "composition_method": "single",
+                    "single_index": args.forced_single_index,
+                    "score_source": None,
+                    "score_normalizer": "none",
+                    "score_stats_path": None,
+                    "score_clip": None,
+                }
+                for layer in forced_single_layers
+            }
+            default_layer_spec = {
+                "compose_domain": args.compose_domain,
+                "composition_method": args.composition_method,
+                "composition_temperature": args.composition_temperature,
+                "composition_topk": args.composition_topk,
+                "compat_threshold": args.compat_threshold,
+                "single_index": args.single_index,
+                "shared_basis_type": args.shared_basis_type,
+                "shared_basis_rank": args.shared_basis_rank,
+                "transport_type": args.transport_type,
+                "score_source": args.score_source,
+                "score_normalizer": args.score_normalizer,
+                "score_stats_path": args.score_stats_path,
+                "score_eps": args.score_eps,
+                "score_clip": args.score_clip,
+                "truthful_score_penalty": args.truthful_score_penalty,
+            }
+            model = load_mixed_composed_reft_model(
+                model=model,
+                specialist_dirs=args.reft_specialists,
+                target_layers=target_layers,
+                default_layer_spec=default_layer_spec,
+                layer_policy_specs=layer_policy_specs,
+            )
+        else:
+            model = load_composed_reft_model(
+                model=model,
+                specialist_dirs=args.reft_specialists,
+                target_layers=target_layers,
+                compose_domain=args.compose_domain,
+                composition_method=args.composition_method,
+                composition_temperature=args.composition_temperature,
+                composition_topk=args.composition_topk,
+                compat_threshold=args.compat_threshold,
+                single_index=args.single_index,
+                shared_basis_type=args.shared_basis_type,
+                shared_basis_rank=args.shared_basis_rank,
+                transport_type=args.transport_type,
+                score_source=args.score_source,
+                score_normalizer=args.score_normalizer,
+                score_stats_path=args.score_stats_path,
+                score_eps=args.score_eps,
+                score_clip=args.score_clip,
+                truthful_score_penalty=args.truthful_score_penalty,
+            )
     elif reft_weights:
         if args.target_layers == [-1]:
             TARGET_LAYERS = list(range(len(model.model.layers)))
@@ -772,8 +1229,68 @@ def load_model(args) -> tuple:
             device_map={"": args.device},
             torch_dtype=torch.bfloat16,
         )
+    elif args.caa_vector_dir or args.caa_vector_dirs:
+        caa_config = apply_caa_steering(
+            model=model,
+            vector_dir=args.caa_vector_dir,
+            vector_dirs=args.caa_vector_dirs,
+            layers=args.caa_layers,
+            alpha=args.caa_alpha,
+            token_strategy=args.caa_token_strategy,
+            composition=args.caa_composition,
+            weights=args.caa_weights,
+        )
+        print(f"apply caa steering: {caa_config}")
+    elif args.iti_artifact_dir or args.iti_artifact_dirs:
+        iti_config = apply_iti_steering(
+            model=model,
+            artifact_dir=args.iti_artifact_dir,
+            artifact_dirs=args.iti_artifact_dirs,
+            alpha=args.iti_alpha,
+            token_strategy=args.iti_token_strategy,
+            include_prompt=bool(args.iti_include_prompt),
+            composition=args.iti_composition,
+            weights=args.iti_weights,
+        )
+        print(f"apply iti steering: {iti_config}")
+    elif args.repe_vector_dir or args.repe_vector_dirs:
+        repe_config = apply_repe_steering(
+            model=model,
+            vector_dir=args.repe_vector_dir,
+            vector_dirs=args.repe_vector_dirs,
+            layers=args.repe_layers,
+            alpha=args.repe_alpha,
+            token_strategy=args.repe_token_strategy,
+            composition=args.repe_composition,
+            weights=args.repe_weights,
+        )
+        print(f"apply repe steering: {repe_config}")
+    elif _use_pyvene_additive(args):
+        model, pyvene_config = apply_pyvene_additive_steering(
+            model,
+            vector_dir=args.pyvene_vector_dir,
+            vector_dirs=args.pyvene_vector_dirs,
+            layers=args.pyvene_layers,
+            alpha=args.pyvene_alpha,
+            component=args.pyvene_component,
+            composition=args.pyvene_composition,
+            weights=args.pyvene_weights,
+            method_tag=args.pyvene_method_tag,
+            intervene_on_prompt=bool(args.pyvene_intervene_on_prompt),
+            base_unit_location=args.pyvene_base_unit_location,
+        )
+        print(f"apply pyvene steering: {pyvene_config}")
     
     return tokenizer, model
+
+
+def resolve_specialist_labels(args) -> List[str]:
+    if args.reft_specialists:
+        return [normalize_specialist_label(path) for path in args.reft_specialists]
+    if args.router_checkpoint_dir:
+        metadata = load_router_training_metadata(args.router_checkpoint_dir, args.router_metadata_path)
+        return [str(label) for label in metadata.get("specialist_labels", [])]
+    return []
 
 
 def load_instruction(args) -> str:
@@ -784,7 +1301,7 @@ def load_instruction(args) -> str:
 
 
 def extract_labeled_choice(sentence: str, label_prefix: str, max_choices: int) -> str:
-    sentence_ = sentence.strip().lower()
+    sentence_ = clean_generation_output(sentence).strip().lower()
     if not sentence_:
         return ""
 
@@ -830,12 +1347,55 @@ def extract_labeled_choice(sentence: str, label_prefix: str, max_choices: int) -
     ]
     if not pred_answers:
         return ""
-    return pred_answers[0]
+    return pred_answers[-1]
+
+
+def extract_choice_by_option_text(args, sentence: str) -> str:
+    if args.dataset not in ['truthfulqa_mc', 'truthfulqa_mc_dev', 'bbq']:
+        return ""
+
+    sentence_ = clean_generation_output(sentence).strip().lower()
+    if not sentence_:
+        return ""
+
+    instruction = getattr(args, "_current_instruction_for_parse", None)
+    if not instruction:
+        return ""
+
+    choice_cache = getattr(args, "_choice_map_cache", None)
+    if choice_cache is None:
+        choice_cache = {}
+        for row in load_data(args):
+            row_instruction = str(row.get("instruction", "") or "").strip()
+            choice_cache[row_instruction] = parse_labeled_choices(row_instruction)
+        setattr(args, "_choice_map_cache", choice_cache)
+
+    option_map = choice_cache.get(str(instruction).strip(), {})
+    if not option_map:
+        return ""
+
+    explicit_match = re.search(
+        r"(?:the\s+)?correct\s+(?:answer|response)\s*(?:is|:)\s*(.+)$",
+        sentence_,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    candidate_text = explicit_match.group(1).strip() if explicit_match else sentence_
+
+    best_label = ""
+    best_length = -1
+    for label, option_text in option_map.items():
+        normalized_option = re.sub(r"\s+", " ", str(option_text).strip().lower())
+        if not normalized_option:
+            continue
+        if normalized_option in candidate_text and len(normalized_option) > best_length:
+            best_label = label.lower()
+            best_length = len(normalized_option)
+    return best_label
 
 
 def extract_answer(args, sentence: str) -> float:
     dataset = args.dataset
-    sentence_ = sentence.strip().lower()
+    sentence_ = clean_generation_output(sentence).strip().lower()
     if dataset == 'boolq':
         pred_answers = re.findall(r'true|false', sentence_)
         if not pred_answers:
@@ -846,8 +1406,11 @@ def extract_answer(args, sentence: str) -> float:
         if not pred_answers:
             return ""
         return pred_answers[0]
-    elif dataset in ['social_i_qa', 'ARC-Challenge', 'ARC-Easy', 'openbookqa', 'truthfulqa_mc', 'bbq']:
-        return extract_labeled_choice(sentence, label_prefix="answer", max_choices=16)
+    elif dataset in ['social_i_qa', 'ARC-Challenge', 'ARC-Easy', 'openbookqa', 'truthfulqa_mc', 'truthfulqa_mc_dev', 'bbq']:
+        by_label = extract_labeled_choice(sentence, label_prefix="answer", max_choices=16)
+        if by_label:
+            return by_label
+        return extract_choice_by_option_text(args, sentence)
     elif dataset == 'hellaswag':
         return extract_labeled_choice(sentence, label_prefix="ending", max_choices=4)
     elif dataset == 'winogrande':

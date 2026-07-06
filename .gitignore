@@ -24,6 +24,14 @@ multi_train/eval_common/__pycache__
 multi_train/eval_ethics/__pycache__
 multi_train/eval_toxicity/__pycache__
 multi_train/eval_bias/__pycache__
+multi_train/eval_privacy/__pycache__
+multi_train/**/__pycache__/
+multi_train/**/*.pyc
+*.pyc
+multi_train/eval_privacy/enron_data
+multi_train/eval_privacy/data
+multi_train/eval_router
+multi_train/eval_specialist
 baseline/LoRA/__pycache__
 multi_train/__pycache__
 dataset/
@@ -45,6 +53,7 @@ baseline/LoRA/__pycahce__
 baseline/LoRA/*sft*
 baseline/LoRA/*lora*
 baseline/LoRA/*/*checkpoint*
+baseline/LoRA/checkpoints
 llama2_subspace_hidden_states/
 multi_train/__pycahce__
 baseline/LoRA/wandb/latest-run
@@ -55,11 +64,45 @@ models
 .DS_Store
 =10.1
 
+# baseline generated artifacts / local downloads; keep source and run configs visible.
+baseline/CAA/analysis/
+baseline/CAA/datasets/
+baseline/CAA/finetune_logs/
+baseline/CAA/normalized_vectors/
+baseline/CAA/results/
+baseline/CAA/vectors/
+baseline/CAA/*.pdf
 
+# honest_llama is a nested git repo; ignore it in the parent repo to avoid
+# the whole directory showing up as one untracked entry.
+baseline/honest_llama/
 
+# baseline generated experiment artifacts
+baseline/*_0/runs/
+baseline/*_0/artifacts/
+baseline/**/__pycache__/
 
+# MAT-Steer generated data/features
+baseline/MAT_steer_4d/features/
+baseline/MAT_steer_4d/runs/
+baseline/MAT_steer_4d/checkpoints/
+baseline/MAT_steer_4d/data/*.json
 
+# nested baseline repo cloned locally; keep it out of parent repo status
+baseline/MAT-Steer/
 
+# downloaded papers / local docs at baseline root
+baseline/*.pdf
 
+# local paper drafts / figures at repo root
+EMNLP_2026/
+EMNLP_2026 copy/
+EMNLP_2026.pdf
+/*.png
+
+# local-only generated bundles / scratch files
+multi_train/eval_toxicity/llm_judge_bundle.tar.gz
+multi_train/eval_toxicity/llm_judge_bundle/
+multi_train/script/Untitled
 
 

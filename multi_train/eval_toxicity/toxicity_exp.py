@@ -1,5 +1,6 @@
 import argparse
 import json
+import random
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,8 +21,19 @@ from toxicity_analysis import score_toxicity_csv
 from multi_train.eval_common.output_naming import build_model_tag, build_output_path
 from multi_train.eval_common.composable_loreft import (
     build_composable_model_tag,
+    build_trained_router_model_tag,
     load_composed_reft_model,
+    load_mixed_composed_reft_model,
+    load_router_training_metadata,
+    load_trained_router_reft_model,
     normalize_specialist_label,
+)
+from baseline.CAA_0.steering import apply_caa_steering, build_caa_model_tag
+from baseline.iti_0.steering import apply_iti_steering, build_iti_model_tag
+from baseline.repe_0.steering import apply_repe_steering, build_repe_model_tag
+from baseline.pyvene_additive_common import (
+    apply_pyvene_additive_steering,
+    build_pyvene_model_tag,
 )
 
 
@@ -47,6 +59,16 @@ PROMPTS = {
 
 SUPPORTED_DATASETS = {"toxic", "nontoxic"}
 SUPPORTED_PROMPTS = set(PROMPTS.keys())
+
+
+def _sorted_unique_ints(values):
+    if not values:
+        return []
+    return sorted({int(value) for value in values})
+
+
+def _use_pyvene_additive(args) -> bool:
+    return bool(args.pyvene_vector_dir or args.pyvene_vector_dirs)
 
 
 def _unwrap_intervention(intervention_value):
@@ -289,6 +311,150 @@ def _finalize_debug_accumulator(accumulator):
     return finalized
 
 
+def _build_pair_name(specialist_labels, idx_i, idx_j):
+    if idx_i < 0 or idx_j < 0:
+        return None
+    label_i = specialist_labels[idx_i] if idx_i < len(specialist_labels) else f"specialist_{idx_i}"
+    label_j = specialist_labels[idx_j] if idx_j < len(specialist_labels) else f"specialist_{idx_j}"
+    return f"{label_i}__{label_j}"
+
+
+def _build_mechanism_trace_records(tasks, model, specialist_labels):
+    records = []
+    if model is None or not hasattr(model, "interventions"):
+        return records
+
+    for layer_key, intervention_value in model.interventions.items():
+        intervention = _unwrap_intervention(intervention_value)
+        alpha = getattr(intervention, "latest_alpha", None)
+        effective_scores = getattr(intervention, "latest_effective_scores", None)
+        pairwise_cos = getattr(intervention, "latest_pairwise_cos", None)
+        topk_mask = getattr(intervention, "latest_topk_mask", None)
+        selected_mask = getattr(intervention, "latest_selected_mask", None)
+        rejected_conflict_mask = getattr(intervention, "latest_rejected_conflict_mask", None)
+        conflict_score = getattr(intervention, "latest_conflict_score", None)
+        score_source = getattr(intervention, "latest_score_source", None)
+        score_stats_source = getattr(intervention, "latest_score_stats_source", None)
+
+        if alpha is None or effective_scores is None or pairwise_cos is None:
+            continue
+
+        alpha = alpha.float()
+        effective_scores = effective_scores.float()
+        pairwise_cos = pairwise_cos.float()
+        topk_mask = topk_mask.bool() if topk_mask is not None else None
+        selected_mask = selected_mask.bool() if selected_mask is not None else None
+        rejected_conflict_mask = rejected_conflict_mask.bool() if rejected_conflict_mask is not None else None
+        conflict_score = conflict_score.float() if conflict_score is not None else None
+
+        batch_size, num_positions, num_specialists = alpha.shape
+        for batch_idx in range(min(batch_size, len(tasks))):
+            task = tasks[batch_idx]
+            for pos_idx in range(num_positions):
+                alpha_row = alpha[batch_idx, pos_idx]
+                score_row = effective_scores[batch_idx, pos_idx]
+                pairwise_row = pairwise_cos[batch_idx, pos_idx]
+                sorted_indices = torch.argsort(score_row, descending=True)
+                top1_idx = int(sorted_indices[0].item()) if num_specialists >= 1 else -1
+                top2_idx = int(sorted_indices[1].item()) if num_specialists >= 2 else -1
+                topk_indices = (
+                    torch.nonzero(topk_mask[batch_idx, pos_idx], as_tuple=False).view(-1).tolist()
+                    if topk_mask is not None
+                    else []
+                )
+                selected_indices = (
+                    torch.nonzero(selected_mask[batch_idx, pos_idx], as_tuple=False).view(-1).tolist()
+                    if selected_mask is not None
+                    else []
+                )
+                rejected_indices = (
+                    torch.nonzero(rejected_conflict_mask[batch_idx, pos_idx], as_tuple=False).view(-1).tolist()
+                    if rejected_conflict_mask is not None
+                    else []
+                )
+
+                candidate_pairwise_cos = (
+                    float(pairwise_row[top2_idx, top1_idx].item())
+                    if top1_idx >= 0 and top2_idx >= 0
+                    else None
+                )
+                candidate_pair_rejected = bool(top2_idx in rejected_indices) if top2_idx >= 0 else False
+
+                softmax_alpha = torch.softmax(score_row, dim=-1)
+                softmax_total_conflict = 0.0
+                truthful_conflict_mass = 0.0
+                max_conflict_value = -1.0
+                max_conflict_pair = None
+                pair_conflicts = []
+                for idx_i in range(num_specialists):
+                    for idx_j in range(idx_i + 1, num_specialists):
+                        pair_cos = float(pairwise_row[idx_i, idx_j].item())
+                        alpha_product = float((softmax_alpha[idx_i] * softmax_alpha[idx_j]).item())
+                        soft_conflict = alpha_product * max(-pair_cos, 0.0)
+                        active_negative = bool(
+                            softmax_alpha[idx_i].item() > 0.1
+                            and softmax_alpha[idx_j].item() > 0.1
+                            and pair_cos < 0.0
+                        )
+                        pair_entry = {
+                            "pair_name": _build_pair_name(specialist_labels, idx_i, idx_j),
+                            "pair_indices": [idx_i, idx_j],
+                            "pairwise_cos": pair_cos,
+                            "softmax_alpha_product": alpha_product,
+                            "softmax_pair_conflict": soft_conflict,
+                            "active_negative": active_negative,
+                        }
+                        pair_conflicts.append(pair_entry)
+                        softmax_total_conflict += soft_conflict
+                        if idx_i == 0:
+                            truthful_conflict_mass += soft_conflict
+                        if soft_conflict > max_conflict_value:
+                            max_conflict_value = soft_conflict
+                            max_conflict_pair = pair_entry
+
+                records.append(
+                    {
+                        "layer": str(layer_key),
+                        "position_index": int(pos_idx),
+                        "dataset": str(task["dataset"]),
+                        "prompt_type": str(task["prompt_type"]),
+                        "sample_id": int(task["sample_id"]),
+                        "filename": str(task["filename"]),
+                        "user_prompt": str(task["user_prompt"]),
+                        "score_source": score_source,
+                        "score_stats_source": score_stats_source,
+                        "effective_scores": [float(x) for x in score_row.tolist()],
+                        "filtered_alpha": [float(x) for x in alpha_row.tolist()],
+                        "softmax_alpha_counterfactual": [float(x) for x in softmax_alpha.tolist()],
+                        "topk_indices": [int(x) for x in topk_indices],
+                        "selected_indices": [int(x) for x in selected_indices],
+                        "rejected_indices": [int(x) for x in rejected_indices],
+                        "top1_index": top1_idx,
+                        "top2_index": top2_idx,
+                        "candidate_pair_name": _build_pair_name(specialist_labels, top1_idx, top2_idx),
+                        "candidate_pairwise_cos": candidate_pairwise_cos,
+                        "candidate_pair_rejected": candidate_pair_rejected,
+                        "filtered_conflict_score": float(conflict_score[batch_idx, pos_idx].item())
+                        if conflict_score is not None
+                        else None,
+                        "softmax_total_conflict": softmax_total_conflict,
+                        "truthful_conflict_mass": truthful_conflict_mass,
+                        "max_conflict_pair": max_conflict_pair,
+                        "pair_conflicts": pair_conflicts,
+                    }
+                )
+    return records
+
+
+def _append_trace_records(trace_path, records):
+    if not records:
+        return
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
+    with trace_path.open("a", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 def parse_args():
     parser = argparse.ArgumentParser("Toxicity generation pipeline")
     parser.add_argument("--base_model", type=str, required=True)
@@ -298,6 +464,11 @@ def parse_args():
     parser.add_argument("--lora_weights", type=str, default=None)
     parser.add_argument("--reft_weights", type=str, default=None)
     parser.add_argument("--reft_specialists", type=str, nargs="+", default=None)
+    parser.add_argument("--router_checkpoint_dir", type=str, default=None)
+    parser.add_argument("--router_metadata_path", type=str, default=None)
+    parser.add_argument("--base_score_stats_path", type=str, default=None)
+    parser.add_argument("--router_feature_stats_path", type=str, default=None)
+    parser.add_argument("--enable_debug_cache", type=int, default=0)
     parser.add_argument("--target_layers", type=int, nargs="+", default=[-1])
     parser.add_argument("--subspace_rank", type=int, default=4)
     parser.add_argument("--positions", type=int, default=5)
@@ -320,6 +491,40 @@ def parse_args():
     parser.add_argument("--score_stats_path", type=str, default=None)
     parser.add_argument("--score_eps", type=float, default=1e-6)
     parser.add_argument("--score_clip", type=float, default=None)
+    parser.add_argument("--truthful_score_penalty", type=float, default=0.0)
+    parser.add_argument("--forced_single_layers", type=int, nargs="+", default=None)
+    parser.add_argument("--forced_single_index", type=int, default=0)
+    parser.add_argument("--caa_vector_dir", type=str, default=None)
+    parser.add_argument("--caa_vector_dirs", type=str, nargs="+", default=None)
+    parser.add_argument("--caa_layers", type=int, nargs="+", default=None)
+    parser.add_argument("--caa_alpha", type=float, default=1.0)
+    parser.add_argument("--caa_token_strategy", choices=["last", "all"], default="last")
+    parser.add_argument("--caa_composition", choices=["single", "sum", "mean", "norm_mean", "weighted_sum"], default="single")
+    parser.add_argument("--caa_weights", type=float, nargs="+", default=None)
+    parser.add_argument("--iti_artifact_dir", type=str, default=None)
+    parser.add_argument("--iti_artifact_dirs", type=str, nargs="+", default=None)
+    parser.add_argument("--iti_alpha", type=float, default=1.0)
+    parser.add_argument("--iti_token_strategy", choices=["last", "all"], default="last")
+    parser.add_argument("--iti_include_prompt", type=int, default=0)
+    parser.add_argument("--iti_composition", choices=["single", "sum", "mean", "norm_mean", "weighted_sum"], default="single")
+    parser.add_argument("--iti_weights", type=float, nargs="+", default=None)
+    parser.add_argument("--repe_vector_dir", type=str, default=None)
+    parser.add_argument("--repe_vector_dirs", type=str, nargs="+", default=None)
+    parser.add_argument("--repe_layers", type=int, nargs="+", default=None)
+    parser.add_argument("--repe_alpha", type=float, default=1.0)
+    parser.add_argument("--repe_token_strategy", choices=["last", "all"], default="last")
+    parser.add_argument("--repe_composition", choices=["single", "sum", "mean", "norm_mean", "weighted_sum"], default="single")
+    parser.add_argument("--repe_weights", type=float, nargs="+", default=None)
+    parser.add_argument("--pyvene_method_tag", type=str, default=None)
+    parser.add_argument("--pyvene_component", type=str, default=None)
+    parser.add_argument("--pyvene_vector_dir", type=str, default=None)
+    parser.add_argument("--pyvene_vector_dirs", type=str, nargs="+", default=None)
+    parser.add_argument("--pyvene_layers", type=int, nargs="+", default=None)
+    parser.add_argument("--pyvene_alpha", type=float, default=1.0)
+    parser.add_argument("--pyvene_composition", choices=["single", "sum", "mean", "norm_mean", "weighted_sum"], default="single")
+    parser.add_argument("--pyvene_weights", type=float, nargs="+", default=None)
+    parser.add_argument("--pyvene_intervene_on_prompt", type=int, default=0)
+    parser.add_argument("--pyvene_base_unit_location", type=int, default=None)
 
     parser.add_argument("--dataset", type=str, default=None)
     parser.add_argument("--prompt", type=str, default=None)
@@ -332,18 +537,23 @@ def parse_args():
         default="multi_train/eval_toxicity/data/user_prompts",
     )
     parser.add_argument("--max_samples", type=int, default=None)
+    parser.add_argument("--sample_mode", choices=["sequential", "random"], default="sequential")
+    parser.add_argument("--sample_seed", type=int, default=42)
 
     parser.add_argument("--n_generations", type=int, default=5)
     parser.add_argument("--max_tokens", type=int, default=50)
     parser.add_argument("--temperature", type=float, default=0.7)
 
     parser.add_argument("--run_analysis", type=int, default=1)
+    parser.add_argument("--allow_analysis_fallback", type=int, default=0)
     parser.add_argument("--analysis_batch_size", type=int, default=32)
     parser.add_argument("--detoxify_model", type=str, default="original")
     parser.add_argument("--analysis_device", type=str, default=None)
 
     parser.add_argument("--results_csv", type=str, default=None)
     parser.add_argument("--summary_json", type=str, default=None)
+    parser.add_argument("--mechanism_trace", type=int, default=0)
+    parser.add_argument("--mechanism_trace_output", type=str, default=None)
 
     return parser.parse_args()
 
@@ -378,7 +588,7 @@ def resolve_datasets_prompts(args):
     return ordered_datasets, ordered_prompts
 
 
-def load_prompts(dataset_root, dataset_name, max_samples=None):
+def load_prompts(dataset_root, dataset_name, max_samples=None, sample_mode="sequential", sample_seed=42):
     dataset_file = Path(dataset_root) / f"{dataset_name}.jsonl"
     if not dataset_file.exists():
         raise FileNotFoundError(f"Prompt dataset not found: {dataset_file}")
@@ -386,8 +596,6 @@ def load_prompts(dataset_root, dataset_name, max_samples=None):
     rows = []
     with open(dataset_file, "r") as f:
         for idx, line in enumerate(f):
-            if max_samples is not None and len(rows) >= max_samples:
-                break
             line = line.strip()
             if not line:
                 continue
@@ -400,6 +608,13 @@ def load_prompts(dataset_root, dataset_name, max_samples=None):
                     "user_prompt": str(prompt.get("text", "")),
                 }
             )
+    if max_samples is not None and len(rows) > max_samples:
+        if sample_mode == "random":
+            rng = random.Random(sample_seed)
+            rows = rng.sample(rows, max_samples)
+            rows = sorted(rows, key=lambda x: int(x["sample_id"]))
+        else:
+            rows = rows[:max_samples]
     return rows
 
 
@@ -536,7 +751,7 @@ def _generate_batch_base_or_lora(prompts, tokenizer, model, args):
 
 
 def generate_batch(prompts, tokenizer, model, args):
-    if args.reft_weights or args.reft_specialists:
+    if args.reft_weights or args.reft_specialists or args.router_checkpoint_dir:
         return _generate_batch_reft(prompts, tokenizer, model, args)
     return _generate_batch_base_or_lora(prompts, tokenizer, model, args)
 
@@ -558,6 +773,27 @@ def load_model(args):
         print(f"load reft weight: {args.reft_weights}")
     elif args.lora_weights:
         print(f"load lora weight: {args.lora_weights}")
+    if args.caa_vector_dir:
+        print(f"load caa vectors from: {args.caa_vector_dir}")
+    if args.caa_vector_dirs:
+        print(f"load caa vectors from: {args.caa_vector_dirs}")
+    if args.iti_artifact_dir:
+        print(f"load iti artifacts from: {args.iti_artifact_dir}")
+    if args.iti_artifact_dirs:
+        print(f"load iti artifacts from: {args.iti_artifact_dirs}")
+    if args.repe_vector_dir:
+        print(f"load repe vectors from: {args.repe_vector_dir}")
+    if args.repe_vector_dirs:
+        print(f"load repe vectors from: {args.repe_vector_dirs}")
+    if args.pyvene_vector_dir:
+        print(f"load pyvene vectors from: {args.pyvene_vector_dir}")
+    if args.pyvene_vector_dirs:
+        print(f"load pyvene vectors from: {args.pyvene_vector_dirs}")
+    if args.forced_single_layers:
+        print(
+            "force single specialist on layers: "
+            f"{args.forced_single_layers} (single_index={args.forced_single_index})"
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(base_model)
     tokenizer.padding_side = "left"
@@ -571,12 +807,20 @@ def load_model(args):
     )
 
     # Keep tokenizer/model token setup consistent with training/evaluate_truth.
+    # Avoid adding a brand new PAD token during evaluation because resizing
+    # embeddings on a loaded 7B/8B/14B model is expensive and can OOM.
     if tokenizer.pad_token is None:
         if tokenizer.unk_token is not None:
             tokenizer.pad_token = tokenizer.unk_token
+        elif tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+        elif tokenizer.bos_token is not None:
+            tokenizer.pad_token = tokenizer.bos_token
         else:
-            tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-            model.resize_token_embeddings(len(tokenizer))
+            raise ValueError(
+                "Tokenizer has no pad_token/unk_token/eos_token/bos_token available. "
+                "Refusing to add a new token during toxicity evaluation because resizing embeddings is too expensive."
+            )
 
     model.config.pad_token_id = tokenizer.pad_token_id
     model.config.bos_token_id = tokenizer.bos_token_id
@@ -586,26 +830,128 @@ def load_model(args):
         model.generation_config.bos_token_id = tokenizer.bos_token_id
         model.generation_config.eos_token_id = tokenizer.eos_token_id
 
-    if args.reft_specialists:
-        model = load_composed_reft_model(
+    if (args.caa_vector_dir or args.caa_vector_dirs) and (
+        args.router_checkpoint_dir
+        or args.reft_specialists
+        or args.reft_weights
+        or args.lora_weights
+        or args.iti_artifact_dir
+        or args.iti_artifact_dirs
+        or args.repe_vector_dir
+        or args.repe_vector_dirs
+        or args.pyvene_vector_dir
+        or args.pyvene_vector_dirs
+    ):
+        raise ValueError("CAA steering cannot be combined with ReFT/LoRA/router weights, ITI, or RepE in toxicity evaluation.")
+    if (args.iti_artifact_dir or args.iti_artifact_dirs) and (
+        args.router_checkpoint_dir
+        or args.reft_specialists
+        or args.reft_weights
+        or args.lora_weights
+        or args.caa_vector_dir
+        or args.caa_vector_dirs
+        or args.repe_vector_dir
+        or args.repe_vector_dirs
+        or args.pyvene_vector_dir
+        or args.pyvene_vector_dirs
+    ):
+        raise ValueError("ITI steering cannot be combined with ReFT/LoRA/router weights, CAA, or RepE in toxicity evaluation.")
+    if (args.repe_vector_dir or args.repe_vector_dirs) and (
+        args.router_checkpoint_dir
+        or args.reft_specialists
+        or args.reft_weights
+        or args.lora_weights
+        or args.caa_vector_dir
+        or args.caa_vector_dirs
+        or args.iti_artifact_dir
+        or args.iti_artifact_dirs
+        or args.pyvene_vector_dir
+        or args.pyvene_vector_dirs
+    ):
+        raise ValueError("RepE steering cannot be combined with ReFT/LoRA/router weights, CAA, or ITI in toxicity evaluation.")
+    if _use_pyvene_additive(args) and (
+        args.router_checkpoint_dir
+        or args.reft_specialists
+        or args.reft_weights
+        or args.lora_weights
+        or args.caa_vector_dir
+        or args.caa_vector_dirs
+        or args.iti_artifact_dir
+        or args.iti_artifact_dirs
+        or args.repe_vector_dir
+        or args.repe_vector_dirs
+    ):
+        raise ValueError("Pyvene additive steering cannot be combined with ReFT/LoRA/router weights, CAA, ITI, or RepE in toxicity evaluation.")
+
+    if args.router_checkpoint_dir:
+        model = load_trained_router_reft_model(
             model=model,
-            specialist_dirs=args.reft_specialists,
-            target_layers=args.target_layers,
-            compose_domain=args.compose_domain,
-            composition_method=args.composition_method,
-            composition_temperature=args.composition_temperature,
-            composition_topk=args.composition_topk,
-            compat_threshold=args.compat_threshold,
-            single_index=args.single_index,
-            shared_basis_type=args.shared_basis_type,
-            shared_basis_rank=args.shared_basis_rank,
-            transport_type=args.transport_type,
-            score_source=args.score_source,
-            score_normalizer=args.score_normalizer,
-            score_stats_path=args.score_stats_path,
-            score_eps=args.score_eps,
-            score_clip=args.score_clip,
+            router_checkpoint_dir=args.router_checkpoint_dir,
+            target_layers=None if args.target_layers == [-1] else args.target_layers,
+            router_metadata_path=args.router_metadata_path,
+            base_score_stats_path=args.base_score_stats_path,
+            router_feature_stats_path=args.router_feature_stats_path,
+            enable_debug_cache=bool(args.enable_debug_cache),
         )
+    elif args.reft_specialists:
+        forced_single_layers = _sorted_unique_ints(args.forced_single_layers)
+        if forced_single_layers:
+            layer_policy_specs = {
+                layer: {
+                    "composition_method": "single",
+                    "single_index": args.forced_single_index,
+                    "score_source": None,
+                    "score_normalizer": "none",
+                    "score_stats_path": None,
+                    "score_clip": None,
+                }
+                for layer in forced_single_layers
+            }
+            default_layer_spec = {
+                "compose_domain": args.compose_domain,
+                "composition_method": args.composition_method,
+                "composition_temperature": args.composition_temperature,
+                "composition_topk": args.composition_topk,
+                "compat_threshold": args.compat_threshold,
+                "single_index": args.single_index,
+                "shared_basis_type": args.shared_basis_type,
+                "shared_basis_rank": args.shared_basis_rank,
+                "transport_type": args.transport_type,
+                "score_source": args.score_source,
+                "score_normalizer": args.score_normalizer,
+                "score_stats_path": args.score_stats_path,
+                "score_eps": args.score_eps,
+                "score_clip": args.score_clip,
+                "truthful_score_penalty": args.truthful_score_penalty,
+            }
+            model = load_mixed_composed_reft_model(
+                model=model,
+                specialist_dirs=args.reft_specialists,
+                target_layers=args.target_layers,
+                default_layer_spec=default_layer_spec,
+                layer_policy_specs=layer_policy_specs,
+            )
+        else:
+            model = load_composed_reft_model(
+                model=model,
+                specialist_dirs=args.reft_specialists,
+                target_layers=args.target_layers,
+                compose_domain=args.compose_domain,
+                composition_method=args.composition_method,
+                composition_temperature=args.composition_temperature,
+                composition_topk=args.composition_topk,
+                compat_threshold=args.compat_threshold,
+                single_index=args.single_index,
+                shared_basis_type=args.shared_basis_type,
+                shared_basis_rank=args.shared_basis_rank,
+                transport_type=args.transport_type,
+                score_source=args.score_source,
+                score_normalizer=args.score_normalizer,
+                score_stats_path=args.score_stats_path,
+                score_eps=args.score_eps,
+                score_clip=args.score_clip,
+                truthful_score_penalty=args.truthful_score_penalty,
+            )
     elif args.reft_weights:
         if args.target_layers == [-1]:
             target_layers = list(range(len(model.model.layers)))
@@ -639,13 +985,69 @@ def load_model(args):
             device_map={"": args.device},
             torch_dtype=torch.bfloat16,
         )
+    elif args.caa_vector_dir or args.caa_vector_dirs:
+        caa_config = apply_caa_steering(
+            model=model,
+            vector_dir=args.caa_vector_dir,
+            vector_dirs=args.caa_vector_dirs,
+            layers=args.caa_layers,
+            alpha=args.caa_alpha,
+            token_strategy=args.caa_token_strategy,
+            composition=args.caa_composition,
+            weights=args.caa_weights,
+        )
+        print(f"apply caa steering: {caa_config}")
+    elif args.iti_artifact_dir or args.iti_artifact_dirs:
+        iti_config = apply_iti_steering(
+            model=model,
+            artifact_dir=args.iti_artifact_dir,
+            artifact_dirs=args.iti_artifact_dirs,
+            alpha=args.iti_alpha,
+            token_strategy=args.iti_token_strategy,
+            include_prompt=bool(args.iti_include_prompt),
+            composition=args.iti_composition,
+            weights=args.iti_weights,
+        )
+        print(f"apply iti steering: {iti_config}")
+    elif args.repe_vector_dir or args.repe_vector_dirs:
+        repe_config = apply_repe_steering(
+            model=model,
+            vector_dir=args.repe_vector_dir,
+            vector_dirs=args.repe_vector_dirs,
+            layers=args.repe_layers,
+            alpha=args.repe_alpha,
+            token_strategy=args.repe_token_strategy,
+            composition=args.repe_composition,
+            weights=args.repe_weights,
+        )
+        print(f"apply repe steering: {repe_config}")
+    elif _use_pyvene_additive(args):
+        model, pyvene_config = apply_pyvene_additive_steering(
+            model,
+            vector_dir=args.pyvene_vector_dir,
+            vector_dirs=args.pyvene_vector_dirs,
+            layers=args.pyvene_layers,
+            alpha=args.pyvene_alpha,
+            component=args.pyvene_component,
+            composition=args.pyvene_composition,
+            weights=args.pyvene_weights,
+            method_tag=args.pyvene_method_tag,
+            intervene_on_prompt=bool(args.pyvene_intervene_on_prompt),
+            base_unit_location=args.pyvene_base_unit_location,
+        )
+        print(f"apply pyvene steering: {pyvene_config}")
 
     return tokenizer, model
 
 
 def resolve_model_tag(args):
+    if args.router_checkpoint_dir:
+        return build_trained_router_model_tag(
+            base_model_path=args.base_model,
+            router_checkpoint_dir=args.router_checkpoint_dir,
+        )
     if args.reft_specialists:
-        return build_composable_model_tag(
+        model_tag = build_composable_model_tag(
             base_model_path=args.base_model,
             specialist_dirs=args.reft_specialists,
             compose_domain=args.compose_domain,
@@ -661,6 +1063,58 @@ def resolve_model_tag(args):
             score_normalizer=args.score_normalizer,
             score_stats_path=args.score_stats_path,
             score_clip=args.score_clip,
+            truthful_score_penalty=args.truthful_score_penalty,
+        )
+        if args.forced_single_layers:
+            forced_layers_tag = "_".join(str(layer) for layer in args.forced_single_layers)
+            model_tag = f"{model_tag}-mixedsingle{args.forced_single_index}-l{forced_layers_tag}"
+        return model_tag
+    if args.caa_vector_dir or args.caa_vector_dirs:
+        return build_caa_model_tag(
+            base_model_path=args.base_model,
+            vector_dir=args.caa_vector_dir,
+            vector_dirs=args.caa_vector_dirs,
+            layers=args.caa_layers,
+            alpha=args.caa_alpha,
+            token_strategy=args.caa_token_strategy,
+            composition=args.caa_composition,
+            weights=args.caa_weights,
+        )
+    if args.iti_artifact_dir or args.iti_artifact_dirs:
+        return build_iti_model_tag(
+            base_model_path=args.base_model,
+            artifact_dir=args.iti_artifact_dir,
+            artifact_dirs=args.iti_artifact_dirs,
+            alpha=args.iti_alpha,
+            token_strategy=args.iti_token_strategy,
+            include_prompt=bool(args.iti_include_prompt),
+            composition=args.iti_composition,
+            weights=args.iti_weights,
+        )
+    if args.repe_vector_dir or args.repe_vector_dirs:
+        return build_repe_model_tag(
+            base_model_path=args.base_model,
+            vector_dir=args.repe_vector_dir,
+            vector_dirs=args.repe_vector_dirs,
+            layers=args.repe_layers,
+            alpha=args.repe_alpha,
+            token_strategy=args.repe_token_strategy,
+            composition=args.repe_composition,
+            weights=args.repe_weights,
+        )
+    if _use_pyvene_additive(args):
+        return build_pyvene_model_tag(
+            method_tag=args.pyvene_method_tag,
+            base_model_path=args.base_model,
+            vector_dir=args.pyvene_vector_dir,
+            vector_dirs=args.pyvene_vector_dirs,
+            layers=args.pyvene_layers,
+            alpha=args.pyvene_alpha,
+            component=args.pyvene_component,
+            composition=args.pyvene_composition,
+            weights=args.pyvene_weights,
+            intervene_on_prompt=bool(args.pyvene_intervene_on_prompt),
+            base_unit_location=args.pyvene_base_unit_location,
         )
 
     return build_model_tag(
@@ -671,6 +1125,13 @@ def resolve_model_tag(args):
 
 
 def build_composable_summary(args):
+    if args.router_checkpoint_dir:
+        return {
+            "router_checkpoint_dir": args.router_checkpoint_dir,
+            "router_metadata_path": args.router_metadata_path,
+            "base_score_stats_path": args.base_score_stats_path,
+            "router_feature_stats_path": args.router_feature_stats_path,
+        }
     return {
         "reft_specialists": list(args.reft_specialists) if args.reft_specialists else None,
         "compose_domain": args.compose_domain if args.reft_specialists else None,
@@ -687,7 +1148,19 @@ def build_composable_summary(args):
         "score_stats_path": args.score_stats_path if args.reft_specialists else None,
         "score_eps": float(args.score_eps) if args.reft_specialists else None,
         "score_clip": args.score_clip if args.reft_specialists else None,
+        "truthful_score_penalty": float(args.truthful_score_penalty) if args.reft_specialists else None,
+        "forced_single_layers": list(args.forced_single_layers) if args.reft_specialists and args.forced_single_layers else None,
+        "forced_single_index": int(args.forced_single_index) if args.reft_specialists and args.forced_single_layers else None,
     }
+
+
+def resolve_specialist_labels(args):
+    if args.reft_specialists:
+        return [normalize_specialist_label(path) for path in args.reft_specialists]
+    if args.router_checkpoint_dir:
+        metadata = load_router_training_metadata(args.router_checkpoint_dir, args.router_metadata_path)
+        return [str(label) for label in metadata.get("specialist_labels", [])]
+    return []
 
 
 def build_tasks(args, datasets, prompts):
@@ -695,7 +1168,13 @@ def build_tasks(args, datasets, prompts):
     dataset_root = Path(args.dataset_root)
 
     for dataset in datasets:
-        samples = load_prompts(dataset_root, dataset, max_samples=args.max_samples)
+        samples = load_prompts(
+            dataset_root,
+            dataset,
+            max_samples=args.max_samples,
+            sample_mode=args.sample_mode,
+            sample_seed=args.sample_seed,
+        )
         for prompt_type in prompts:
             sys_prompt = PROMPTS[prompt_type]["sys_prompt"] + " " + PROMPTS[prompt_type]["task_desc"] + "\n"
             for sample in samples:
@@ -760,7 +1239,16 @@ def build_pending_tasks(tasks, existing_index, n_generations):
     return pending
 
 
-def run_generation(args, tokenizer, model, pending_tasks, model_tag, debug_accumulator=None):
+def run_generation(
+    args,
+    tokenizer,
+    model,
+    pending_tasks,
+    model_tag,
+    debug_accumulator=None,
+    specialist_labels=None,
+    trace_path=None,
+):
     rows = []
 
     progress = tqdm(range(0, len(pending_tasks), args.batch_size), desc="Generating toxicity")
@@ -770,6 +1258,9 @@ def run_generation(args, tokenizer, model, pending_tasks, model_tag, debug_accum
 
         batch_outputs = generate_batch(prompts, tokenizer, model, args)
         _update_debug_accumulator(debug_accumulator, model)
+        if args.mechanism_trace and trace_path is not None:
+            trace_records = _build_mechanism_trace_records(batch, model, specialist_labels or [])
+            _append_trace_records(trace_path, trace_records)
         for task, sample_outputs in zip(batch, batch_outputs):
             for generation_idx in task["missing_generation_indices"]:
                 raw_output = sample_outputs[generation_idx] if generation_idx < len(sample_outputs) else sample_outputs[-1]
@@ -796,7 +1287,17 @@ def run_generation(args, tokenizer, model, pending_tasks, model_tag, debug_accum
 
 
 def build_default_results_csv(args, model_tag):
-    if args.reft_specialists:
+    if (
+        args.reft_specialists
+        or args.caa_vector_dir
+        or args.caa_vector_dirs
+        or args.iti_artifact_dir
+        or args.iti_artifact_dirs
+        or args.repe_vector_dir
+        or args.repe_vector_dirs
+        or args.pyvene_vector_dir
+        or args.pyvene_vector_dirs
+    ):
         return str(Path("multi_train/eval_toxicity/data/generations") / f"{model_tag}-toxicity.csv")
 
     return build_output_path(
@@ -809,15 +1310,33 @@ def build_default_results_csv(args, model_tag):
     )
 
 
-def build_run_summary(args, model_tag, results_csv, scored_csv, datasets, prompts, analysis_summary, total_rows, newly_generated_rows, debug_summary_file):
+def build_run_summary(
+    args,
+    model_tag,
+    results_csv,
+    scored_csv,
+    datasets,
+    prompts,
+    analysis_summary,
+    total_rows,
+    newly_generated_rows,
+    debug_summary_file,
+    analysis_status="completed",
+    analysis_error=None,
+):
+    analysis_summary = analysis_summary or {}
     return {
         "model_tag": model_tag,
         "results_csv": str(results_csv),
-        "scored_csv": str(scored_csv),
+        "scored_csv": str(scored_csv) if scored_csv is not None else None,
         "datasets": datasets,
         "prompts": prompts,
         "task_metrics": analysis_summary.get("task_metrics", {}),
-        "overall_score": float(analysis_summary.get("overall_score", 0.0)),
+        "overall_score": (
+            float(analysis_summary["overall_score"])
+            if analysis_summary.get("overall_score") is not None
+            else None
+        ),
         "total_rows": int(total_rows),
         "newly_generated_rows": int(newly_generated_rows),
         "newly_scored_rows": int(analysis_summary.get("newly_scored_rows", 0)),
@@ -829,12 +1348,69 @@ def build_run_summary(args, model_tag, results_csv, scored_csv, datasets, prompt
         "base_model": args.base_model,
         "reft_weights": args.reft_weights,
         "lora_weights": args.lora_weights,
+        "caa_vector_dir": args.caa_vector_dir,
+        "caa_vector_dirs": args.caa_vector_dirs,
+        "caa_layers": args.caa_layers,
+        "caa_alpha": float(args.caa_alpha),
+        "caa_token_strategy": args.caa_token_strategy,
+        "caa_composition": args.caa_composition,
+        "caa_weights": args.caa_weights,
+        "iti_artifact_dir": args.iti_artifact_dir,
+        "iti_artifact_dirs": args.iti_artifact_dirs,
+        "iti_alpha": float(args.iti_alpha),
+        "iti_token_strategy": args.iti_token_strategy,
+        "iti_include_prompt": bool(args.iti_include_prompt),
+        "iti_composition": args.iti_composition,
+        "iti_weights": args.iti_weights,
+        "repe_vector_dir": args.repe_vector_dir,
+        "repe_vector_dirs": args.repe_vector_dirs,
+        "repe_layers": args.repe_layers,
+        "repe_alpha": float(args.repe_alpha),
+        "repe_token_strategy": args.repe_token_strategy,
+        "repe_composition": args.repe_composition,
+        "repe_weights": args.repe_weights,
+        "pyvene_method_tag": args.pyvene_method_tag,
+        "pyvene_component": args.pyvene_component,
+        "pyvene_vector_dir": args.pyvene_vector_dir,
+        "pyvene_vector_dirs": args.pyvene_vector_dirs,
+        "pyvene_layers": args.pyvene_layers,
+        "pyvene_alpha": float(args.pyvene_alpha),
+        "pyvene_composition": args.pyvene_composition,
+        "pyvene_weights": args.pyvene_weights,
+        "pyvene_intervene_on_prompt": bool(args.pyvene_intervene_on_prompt),
+        "pyvene_base_unit_location": args.pyvene_base_unit_location,
         "dataset_root": args.dataset_root,
         "max_samples": args.max_samples,
+        "sample_mode": args.sample_mode,
+        "sample_seed": int(args.sample_seed),
         "debug_summary_file": debug_summary_file,
+        "mechanism_trace_enabled": bool(args.mechanism_trace),
+        "mechanism_trace_output": (
+            args.mechanism_trace_output
+            if args.mechanism_trace and args.mechanism_trace_output
+            else str(Path(results_csv).with_name(f"{Path(results_csv).stem}_mechanism_trace.jsonl"))
+            if args.mechanism_trace
+            else None
+        ),
+        "run_analysis_requested": int(args.run_analysis),
+        "analysis_status": analysis_status,
+        "analysis_error": analysis_error,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         **build_composable_summary(args),
     }
+
+
+def resolve_summary_json(args, model_tag):
+    if args.summary_json:
+        return Path(args.summary_json)
+    return Path("multi_train/eval_toxicity/data/summaries") / f"{model_tag}-toxicity-summary.json"
+
+
+def save_run_summary(summary_path, run_summary):
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(summary_path, "w") as f:
+        json.dump(run_summary, f, indent=2)
+    print(f"Run summary saved to: {summary_path}")
 
 
 def main():
@@ -842,12 +1418,22 @@ def main():
 
     args.reft_weights = args.reft_weights or None
     args.lora_weights = args.lora_weights or None
+    args.router_checkpoint_dir = args.router_checkpoint_dir or None
+    args.router_metadata_path = args.router_metadata_path or None
+    args.base_score_stats_path = args.base_score_stats_path or None
+    args.router_feature_stats_path = args.router_feature_stats_path or None
     if args.reft_specialists:
         args.reft_specialists = [path for path in args.reft_specialists if str(path).strip()]
         if len(args.reft_specialists) == 0:
             args.reft_specialists = None
     if args.reft_weights and args.lora_weights:
         raise ValueError("`reft_weights` and `lora_weights` cannot be used at the same time.")
+    if args.router_checkpoint_dir and args.reft_weights:
+        raise ValueError("`router_checkpoint_dir` and `reft_weights` cannot be used at the same time.")
+    if args.router_checkpoint_dir and args.reft_specialists:
+        raise ValueError("`router_checkpoint_dir` and `reft_specialists` cannot be used at the same time.")
+    if args.router_checkpoint_dir and args.lora_weights:
+        raise ValueError("`router_checkpoint_dir` and `lora_weights` cannot be used at the same time.")
     if args.reft_specialists and args.reft_weights:
         raise ValueError("`reft_specialists` and `reft_weights` cannot be used at the same time.")
     if args.reft_specialists and args.lora_weights:
@@ -856,7 +1442,7 @@ def main():
     datasets, prompts = resolve_datasets_prompts(args)
 
     model_tag = resolve_model_tag(args)
-    specialist_labels = [normalize_specialist_label(path) for path in args.reft_specialists] if args.reft_specialists else []
+    specialist_labels = resolve_specialist_labels(args)
 
     results_csv = Path(args.results_csv) if args.results_csv else Path(build_default_results_csv(args, model_tag))
     results_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -876,7 +1462,22 @@ def main():
     if pending_tasks:
         tokenizer, model = load_model(args)
         debug_accumulator = _init_debug_accumulator(model, specialist_labels)
-        generated_rows = run_generation(args, tokenizer, model, pending_tasks, model_tag, debug_accumulator)
+        trace_path = None
+        if args.mechanism_trace:
+            if args.mechanism_trace_output:
+                trace_path = Path(args.mechanism_trace_output)
+            else:
+                trace_path = results_csv.with_name(f"{results_csv.stem}_mechanism_trace.jsonl")
+        generated_rows = run_generation(
+            args,
+            tokenizer,
+            model,
+            pending_tasks,
+            model_tag,
+            debug_accumulator,
+            specialist_labels=specialist_labels,
+            trace_path=trace_path,
+        )
         del tokenizer
         del model
 
@@ -921,24 +1522,57 @@ def main():
         debug_summary_file = str(debug_summary_path)
         print(f"Debug summary saved to: {debug_summary_path}")
 
+    summary_path = resolve_summary_json(args, model_tag)
+
     if not args.run_analysis:
+        run_summary = build_run_summary(
+            args=args,
+            model_tag=model_tag,
+            results_csv=results_csv,
+            scored_csv=None,
+            datasets=datasets,
+            prompts=prompts,
+            analysis_summary=None,
+            total_rows=len(merged_df),
+            newly_generated_rows=len(generated_rows),
+            debug_summary_file=debug_summary_file,
+            analysis_status="skipped",
+            analysis_error="analysis disabled by run_analysis=0",
+        )
+        save_run_summary(summary_path, run_summary)
         return
 
-    analysis_summary, scored_csv = score_toxicity_csv(
-        results_csv=results_csv,
-        scored_csv_path=None,
-        datasets=datasets,
-        prompts=prompts,
-        batch_size=args.analysis_batch_size,
-        detoxify_model_name=args.detoxify_model,
-        device=args.analysis_device,
-    )
-
-    summary_json = args.summary_json
-    if summary_json is None:
-        summary_json = str(
-            Path("multi_train/eval_toxicity/data/summaries") / f"{model_tag}-toxicity-summary.json"
+    try:
+        analysis_summary, scored_csv = score_toxicity_csv(
+            results_csv=results_csv,
+            scored_csv_path=None,
+            datasets=datasets,
+            prompts=prompts,
+            batch_size=args.analysis_batch_size,
+            detoxify_model_name=args.detoxify_model,
+            device=args.analysis_device,
         )
+    except Exception as exc:
+        if not args.allow_analysis_fallback:
+            raise
+        analysis_error = f"{type(exc).__name__}: {exc}"
+        print(f"[analysis] fallback enabled, skipping toxicity analysis: {analysis_error}")
+        run_summary = build_run_summary(
+            args=args,
+            model_tag=model_tag,
+            results_csv=results_csv,
+            scored_csv=None,
+            datasets=datasets,
+            prompts=prompts,
+            analysis_summary=None,
+            total_rows=len(merged_df),
+            newly_generated_rows=len(generated_rows),
+            debug_summary_file=debug_summary_file,
+            analysis_status="failed_fallback",
+            analysis_error=analysis_error,
+        )
+        save_run_summary(summary_path, run_summary)
+        return
 
     run_summary = build_run_summary(
         args=args,
@@ -951,14 +1585,10 @@ def main():
         total_rows=len(merged_df),
         newly_generated_rows=len(generated_rows),
         debug_summary_file=debug_summary_file,
+        analysis_status="completed",
+        analysis_error=None,
     )
-
-    summary_path = Path(summary_json)
-    summary_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(summary_path, "w") as f:
-        json.dump(run_summary, f, indent=2)
-
-    print(f"Run summary saved to: {summary_path}")
+    save_run_summary(summary_path, run_summary)
 
 
 if __name__ == "__main__":
